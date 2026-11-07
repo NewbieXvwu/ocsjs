@@ -1,5 +1,18 @@
 # Changelog
 
+## [5.3.2](https://github.com/ocsjs/ocsjs/compare/5.3.1...5.3.2) (2026-11-07)
+
+
+### 🐛 问题修复
+
+* 修复智慧树AI教学中心随堂练习无法运行的问题 ([578e95c](https://github.com/ocsjs/ocsjs/commit/578e95c94b71c22329bcae729005b8a34e05f9c0))
+
+
+### ⚡ 优化改进
+
+* 优化更新弹窗的按钮间隔 ([dc7367a](https://github.com/ocsjs/ocsjs/commit/dc7367a7c241105ff6392368d8bbd2c93bf68cf3))
+* 增加脚本识别类型、 优化主脚本的脚本配置提示 ([1e6f2bd](https://github.com/ocsjs/ocsjs/commit/1e6f2bd4fb560bdee39adc738f0a0daa7dfa23b7))
+
 ## [5.3.1](https://github.com/ocsjs/ocsjs/compare/5.3.0...5.3.1) (2026-11-05)
 
 
