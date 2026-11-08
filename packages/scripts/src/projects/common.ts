@@ -75,7 +75,7 @@ function createAnswererApiKeyField(kind: AnswererApiKeyKind, label: string, plac
 	input.value = readAnswererApiKeys()[kind];
 	input.addEventListener('change', () => {
 		saveAnswererApiKey(kind, input.value);
-		$message.success({ content: `${label} 已保存在本机浏览器（不会写入题库配置）` });
+		$message.success({ content: `${label} 已保存` });
 	});
 	return h('div', { style: { marginTop: '8px' } }, [h('div', { className: 'secondary' }, label), input]);
 }
@@ -408,7 +408,7 @@ export const CommonProject = Project.create({
 								'textarea',
 								{
 									className: 'modal-input',
-									style: { minHeight: '250px', width: 'calc(100% - 20px)', maxWidth: '100%' },
+									style: { minHeight: '150px', width: '100%', maxWidth: '100%' },
 									placeholder: aw.length ? '重新输入题库配置' : '输入你的题库配置...，不会请看上方填写教程'
 								},
 								aw.length === 0 ? '' : JSON.stringify(aw, null, 4)
@@ -726,7 +726,7 @@ export const CommonProject = Project.create({
 								},
 								[
 									h('option', { value: 'off' }, '关闭'),
-									h('option', { value: 'builtin' }, '内置搜索（官方端点）'),
+									h('option', { value: 'builtin' }, '内置搜索'),
 									h('option', { value: 'custom' }, '自定义搜索')
 								]
 							);
@@ -792,176 +792,180 @@ export const CommonProject = Project.create({
 									list.push(preset);
 									textarea.value = JSON.stringify(list, null, 4);
 									$message.success({
-										content: '已添加 OpenCode Go 预设，请确认模型与密钥后点击「保存配置」。'
+										content: '已添加 OpenCode Go 预设。'
 									});
 								};
 							});
 
-							/** 手动配置底部（填写/修改区 + 操作按钮），自定义题库获取方式下显示 */
-							const manualFooter = h('div', { style: { width: '100%' } }, [
+							/** 手动配置表单（放在弹窗主体中滚动），按钮放在弹窗 footer */
+							const manualBody = h('div', { style: { width: '100%' } }, [
 								h('div', { className: 'separator secondary' }, '题库配置填写/修改区'),
 								textarea,
+								h('div', { className: 'separator secondary', style: { marginTop: '12px' } }, 'API 密钥'),
 								h(
 									'div',
-									{ className: 'separator secondary', style: { marginTop: '12px' } },
-									'API 密钥（可选，仅保存在本机）'
-								),
-								h('div', { style: { marginTop: '8px', fontSize: '12px' } }, [
-									h(
-										'div',
-										{ className: 'secondary' },
-										// eslint-disable-next-line no-template-curly-in-string
-										'在题库配置中通过 ${openaiApiKey} / ${geminiApiKey} / ${opencodeGoApiKey} 等占位符引用，例如请求头 Authorization: Bearer ${openaiApiKey}。密钥只保存在本机浏览器，不会写入题库配置，也不会随配置导出。搜索密钥仅用于 Exa / Tavily / DeepSeek 搜索。'
-									),
-									h('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' } }, [
+									{
+										style: {
+											display: 'grid',
+											gridTemplateColumns: 'repeat(2, minmax(0, 1fr))',
+											gap: '8px 12px',
+											marginTop: '8px',
+											fontSize: '12px'
+										}
+									},
+									[
 										createAnswererApiKeyField('openai', 'OpenAI API Key', 'sk-...'),
 										createAnswererApiKeyField('gemini', 'Gemini API Key', 'AIza...'),
-										createAnswererApiKeyField('opencodeGo', 'OpenCode Go API Key', 'OpenCode Console 生成的 Key'),
+										createAnswererApiKeyField('opencodeGo', 'OpenCode Go API Key', 'OpenCode Go Key'),
 										createAnswererApiKeyField('deepseek', 'DeepSeek API Key', 'sk-...'),
 										createAnswererApiKeyField('exa', 'Exa API Key', 'Exa API Key'),
 										createAnswererApiKeyField('tavily', 'Tavily API Key', 'tvly-...')
-									])
-								]),
-								h('div', { className: 'separator secondary', style: { marginTop: '12px' } }, '搜索增强（可选）'),
-								h('div', { style: { marginTop: '8px', fontSize: '12px' } }, [
-									h(
-										'div',
-										{ className: 'secondary' },
-										'内置搜索：OpenAI / DeepSeek Responses 使用 web_search 工具，Gemini 使用 Google Search grounding，DeepSeek Chat Completions 使用 Search API。自定义搜索通过函数工具 web_search 交由模型按需调用（Exa / Tavily / DeepSeek），搜索结果以工具结果回传，不再拼进题干。搜索失败不会中断答题。'
-									),
-									h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '8px', marginTop: '8px' } }, [
+									]
+								),
+								h('div', { className: 'separator secondary', style: { marginTop: '12px' } }, '搜索增强'),
+								h(
+									'div',
+									{
+										style: {
+											display: 'flex',
+											flexWrap: 'wrap',
+											gap: '12px',
+											marginTop: '8px',
+											fontSize: '12px'
+										}
+									},
+									[
 										h('label', { style: { display: 'flex', alignItems: 'center', gap: '4px' } }, [
 											h('span', '模式'),
 											searchModeSelect
 										]),
 										h('label', { style: { display: 'flex', alignItems: 'center', gap: '4px' } }, [
-											h('span', '自定义提供方'),
+											h('span', '提供方'),
 											searchProviderSelect
 										])
-									])
-								]),
-								h('div', { className: 'separator secondary', style: { marginTop: '12px' } }, 'OpenCode Go（可选）'),
-								h('div', { style: { marginTop: '8px', fontSize: '12px' } }, [
-									h(
-										'div',
-										{ className: 'secondary' },
-										'OpenCode Go 面向编程代理，用于答题可能被限流或封禁，请自行评估风险。请求会自动补充 x-opencode-session、x-opencode-client 与 User-Agent，并改走 GM_xmlhttpRequest。'
-									),
-									h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '8px', marginTop: '8px' } }, [
-										openCodeModelInput,
-										openCodePresetButton
-									]),
+									]
+								),
+								h('div', { className: 'separator secondary', style: { marginTop: '12px' } }, 'OpenCode Go'),
+								h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '8px', marginTop: '8px' } }, [
+									openCodeModelInput,
+									openCodePresetButton,
 									openCodeModelList
 								]),
-								h('div', { style: { marginTop: '12px', fontSize: '12px' } }, [
-									// 解析器选项独占一行
-									h('div', { style: { marginBottom: '12px' } }, ['解析器：', select]),
-									// 清空题库配置左对齐，关闭/保存配置右对齐
-									h('div', { style: { display: 'flex', flexWrap: 'wrap', justifyContent: 'flex-end' } }, [
-										h('button', '清空题库配置', (btn) => {
-											btn.className = 'modal-cancel-button';
-											enlargeFooterButton(btn);
-											btn.style.marginRight = 'auto';
-											btn.onclick = () => clearAnswererConfig();
-										}),
-										h('button', '关闭', (btn) => {
-											btn.className = 'modal-cancel-button';
-											enlargeFooterButton(btn);
-											btn.style.marginRight = '12px';
-											btn.onclick = () => modal?.remove();
-										}),
-										h('button', '保存配置', (btn) => {
-											btn.className = 'modal-confirm-button';
-											enlargeFooterButton(btn);
-											btn.onclick = async () => {
-												const value = textarea.value;
-
-												if (!value) {
-													$modal.alert({
-														content: h('div', '不能为空！')
-													});
-													return;
-												}
-												if (value.includes('adapter-service/search') && (select.value === 'TikuAdapter') === false) {
-													$modal.alert({
-														content: h('div', [
-															'检测到您可能正在使用 ',
-															h(
-																'a',
-																{ href: 'https://github.com/DokiDoki1103/tikuAdapter#readme' },
-																'TikuAdapter 题库'
-															),
-															'，但是您选择的解析器不是 TikuAdapter，请选择 TikuAdapter 解析器，并填写接口地址即可，例如：http://localhost:8060/adapter-service/search，或者忽略此警告。'
-														]),
-														confirmButtonText: '切换至 TikuAdapter 解析器，并识别接口地址',
-														onConfirm() {
-															const origin = textarea.value.match(/http:\/\/(.+)\/adapter-service\/search/)?.[1] || '';
-															textarea.value = `http://${origin}/adapter-service/search`;
-															select.value = 'TikuAdapter';
-														}
-													});
-													return;
-												}
-
-												try {
-													const awsResult: AnswererWrapper[] = [];
-													if (select.value === 'TikuAdapter') {
-														if (value.startsWith('http') === false) {
-															$modal.alert({
-																content: h('div', [
-																	'格式错误，TikuAdapter解析器只能解析 url 链接，请重新输入！或者查看：',
-																	h(
-																		'a',
-																		{ href: 'https://github.com/DokiDoki1103/tikuAdapter#readme' },
-																		'https://github.com/DokiDoki1103/tikuAdapter#readme'
-																	)
-																])
-															});
-															return;
-														}
-														select.value = '默认';
-														awsResult.push({
-															name: 'TikuAdapter题库',
-															url: value,
-															homepage: 'https://github.com/DokiDoki1103/tikuAdapter',
-															method: 'post',
-															type: 'GM_xmlhttpRequest',
-															contentType: 'json',
-															headers: {},
-															data: {
-																// eslint-disable-next-line no-template-curly-in-string
-																question: '${title}',
-																options: {
-																	handler: "return (env)=>env.options?.split('\\n')"
-																},
-																type: {
-																	handler:
-																		" return (env)=> env.type === 'single' ? 0 : env.type === 'multiple' ? 1 : env.type === 'completion' ? 3 : env.type === 'judgement' ? 4 : undefined"
-																}
-															},
-															handler: "return (res)=>res.answer.allAnswer.map(i=>([res.question,i.join('#')]))"
-														});
-													} else {
-														const contents = value
-															.split('###')
-															.map((i) => i.trim())
-															.filter(Boolean);
-														for (const content of contents) {
-															awsResult.push(...(await AnswerWrapperParser.from(content)));
-														}
-													}
-
-													await applyAws(awsResult);
-												} catch (e: any) {
-													$modal.alert({
-														content: h('div', [h('div', '解析失败，原因如下 :'), h('div', e.message)])
-													});
-												}
-											};
-										})
-									])
-								])
+								h('div', { style: { marginTop: '12px', fontSize: '12px' } }, ['解析器：', select])
 							]);
+
+							const manualFooter = h(
+								'div',
+								{
+									style: {
+										display: 'flex',
+										flexWrap: 'wrap',
+										justifyContent: 'flex-end',
+										alignItems: 'center',
+										gap: '8px',
+										width: '100%'
+									}
+								},
+								[
+									h('button', '清空题库配置', (btn) => {
+										btn.className = 'modal-cancel-button';
+										enlargeFooterButton(btn);
+										btn.style.marginRight = 'auto';
+										btn.onclick = () => clearAnswererConfig();
+									}),
+									h('button', '关闭', (btn) => {
+										btn.className = 'modal-cancel-button';
+										enlargeFooterButton(btn);
+										btn.style.marginRight = '12px';
+										btn.onclick = () => modal?.remove();
+									}),
+									h('button', '保存配置', (btn) => {
+										btn.className = 'modal-confirm-button';
+										enlargeFooterButton(btn);
+										btn.onclick = async () => {
+											const value = textarea.value;
+
+											if (!value) {
+												$modal.alert({
+													content: h('div', '不能为空！')
+												});
+												return;
+											}
+											if (value.includes('adapter-service/search') && (select.value === 'TikuAdapter') === false) {
+												$modal.alert({
+													content: h('div', [
+														'检测到您可能正在使用 ',
+														h('a', { href: 'https://github.com/DokiDoki1103/tikuAdapter#readme' }, 'TikuAdapter 题库'),
+														'，但是您选择的解析器不是 TikuAdapter，请选择 TikuAdapter 解析器，并填写接口地址即可，例如：http://localhost:8060/adapter-service/search，或者忽略此警告。'
+													]),
+													confirmButtonText: '切换至 TikuAdapter 解析器，并识别接口地址',
+													onConfirm() {
+														const origin = textarea.value.match(/http:\/\/(.+)\/adapter-service\/search/)?.[1] || '';
+														textarea.value = `http://${origin}/adapter-service/search`;
+														select.value = 'TikuAdapter';
+													}
+												});
+												return;
+											}
+
+											try {
+												const awsResult: AnswererWrapper[] = [];
+												if (select.value === 'TikuAdapter') {
+													if (value.startsWith('http') === false) {
+														$modal.alert({
+															content: h('div', [
+																'格式错误，TikuAdapter解析器只能解析 url 链接，请重新输入！或者查看：',
+																h(
+																	'a',
+																	{ href: 'https://github.com/DokiDoki1103/tikuAdapter#readme' },
+																	'https://github.com/DokiDoki1103/tikuAdapter#readme'
+																)
+															])
+														});
+														return;
+													}
+													select.value = '默认';
+													awsResult.push({
+														name: 'TikuAdapter题库',
+														url: value,
+														homepage: 'https://github.com/DokiDoki1103/tikuAdapter',
+														method: 'post',
+														type: 'GM_xmlhttpRequest',
+														contentType: 'json',
+														headers: {},
+														data: {
+															// eslint-disable-next-line no-template-curly-in-string
+															question: '${title}',
+															options: {
+																handler: "return (env)=>env.options?.split('\\n')"
+															},
+															type: {
+																handler:
+																	" return (env)=> env.type === 'single' ? 0 : env.type === 'multiple' ? 1 : env.type === 'completion' ? 3 : env.type === 'judgement' ? 4 : undefined"
+															}
+														},
+														handler: "return (res)=>res.answer.allAnswer.map(i=>([res.question,i.join('#')]))"
+													});
+												} else {
+													const contents = value
+														.split('###')
+														.map((i) => i.trim())
+														.filter(Boolean);
+													for (const content of contents) {
+														awsResult.push(...(await AnswerWrapperParser.from(content)));
+													}
+												}
+
+												await applyAws(awsResult);
+											} catch (e: any) {
+												$modal.alert({
+													content: h('div', [h('div', '解析失败，原因如下 :'), h('div', e.message)])
+												});
+											}
+										};
+									})
+								]
+							);
 
 							/** 弹窗内容与底部：官方题库（主按钮默认）= 一键获取；自定义题库（「⋯」下拉进入）= 手动配置 */
 							let modalContent: string | HTMLElement;
@@ -1031,7 +1035,7 @@ export const CommonProject = Project.create({
 								modalFooter = connectFooter;
 							} else {
 								// 自定义题库（或未配置 provider）：保持原有单页结构，已配置列表脱离 notes 独立展示
-								modalContent = h('div', [manualNotes, listContainer]);
+								modalContent = h('div', [manualNotes, listContainer, manualBody]);
 								modalFooter = manualFooter;
 							}
 

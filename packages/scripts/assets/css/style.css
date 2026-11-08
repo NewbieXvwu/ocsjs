@@ -1412,6 +1412,23 @@ header-element .dropdown.active .dropdown-trigger-element {
   color: #002991;
   border: 1px solid #aac2ff;
 }
+modal-element {
+  box-sizing: border-box;
+  max-height: calc(100vh - 24px);
+  display: flex;
+  flex-direction: column;
+}
+modal-element .modal-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+}
+modal-element .modal-footer {
+  flex: 0 0 auto;
+}
+modal-element .modal-input {
+  box-sizing: border-box;
+}
 modal-element .modal-input:focus {
   border: 1px solid #2b67ff;
   box-shadow: 0px 0px 4px rgba(43, 103, 255, 0.32);
