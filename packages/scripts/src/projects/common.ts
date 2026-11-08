@@ -82,12 +82,12 @@ function createAnswererApiKeyField(kind: AnswererApiKeyKind, label: string, plac
 
 /** OpenCode Go 支持的常用模型 ID（仅作为输入建议，用户可以自行修改） */
 const OPENCODE_GO_MODELS = [
+	'deepseek-v4.1-flash',
+	'deepseek-v4-pro',
 	'gpt-6-luna',
 	'gpt-5.6-luna',
 	'glm-5.3',
 	'kimi-k3',
-	'deepseek-v4.1-flash',
-	'deepseek-v4-pro',
 	'minimax-m3',
 	'qwen3.8-max',
 	'gemini-4-argon'
@@ -758,7 +758,7 @@ export const CommonProject = Project.create({
 							/** OpenCode Go 预设插入 */
 							const openCodeModelInput = h('input', {
 								className: 'modal-input',
-								value: 'gpt-6-luna',
+								value: 'deepseek-v4.1-flash',
 								placeholder: '模型 ID',
 								style: { width: '180px' }
 							});
@@ -773,7 +773,7 @@ export const CommonProject = Project.create({
 								btn.style.padding = '4px 12px';
 								btn.style.fontSize = '13px';
 								btn.onclick = () => {
-									const model = (openCodeModelInput as HTMLInputElement).value.trim() || 'gpt-6-luna';
+									const model = (openCodeModelInput as HTMLInputElement).value.trim() || 'deepseek-v4.1-flash';
 									let list: AnswererWrapper[] = [];
 									const raw = textarea.value.trim();
 									if (raw) {
