@@ -215,10 +215,44 @@ async function searchDeepSeek(query: string, apiKey: string, maxResults: number)
 	return lines.join('\n\n');
 }
 
+function appendInstructions(data: any, guidance: string) {
+	const current = typeof data.instructions === 'string' ? data.instructions.trim() : '';
+	if (current.includes(guidance)) return data;
+	return { ...data, instructions: current ? `${current}\n\n${guidance}` : guidance };
+}
+
+function appendGeminiSystemInstruction(data: any, guidance: string) {
+	const current = data.systemInstruction;
+	if (current && typeof current === 'object' && Array.isArray(current.parts)) {
+		if (current.parts.some((part: any) => typeof part?.text === 'string' && part.text.includes(guidance))) {
+			return data;
+		}
+		return {
+			...data,
+			systemInstruction: { ...current, parts: [...current.parts, { text: guidance }] }
+		};
+	}
+	if (typeof current === 'string') {
+		if (current.includes(guidance)) return data;
+		return {
+			...data,
+			systemInstruction: { parts: [{ text: `${current}\n\n${guidance}` }] }
+		};
+	}
+	return { ...data, systemInstruction: { parts: [{ text: guidance }] } };
+}
+
 /** 官方端点的内置搜索工具注入 */
 export function applyBuiltinSearch(endpoint: string, data: any) {
 	if (!data || typeof data !== 'object' || Array.isArray(data)) return data;
-	if (isOfficialOpenAIEndpoint(endpoint) || isOfficialDeepSeekResponsesEndpoint(endpoint)) {
+	if (isOfficialOpenAIEndpoint(endpoint)) {
+		const tools = Array.isArray(data.tools) ? data.tools.slice() : [];
+		if (!tools.some((tool: any) => tool?.type === 'web_search' || tool?.type === 'web_search_preview')) {
+			tools.push({ type: 'web_search' });
+		}
+		return appendInstructions({ ...data, tools }, ANSWERER_SEARCH_USAGE_GUIDANCE);
+	}
+	if (isOfficialDeepSeekResponsesEndpoint(endpoint)) {
 		const tools = Array.isArray(data.tools) ? data.tools.slice() : [];
 		if (!tools.some((tool: any) => tool?.type === 'web_search' || tool?.type === 'web_search_preview')) {
 			tools.push({ type: 'web_search' });
@@ -230,7 +264,7 @@ export function applyBuiltinSearch(endpoint: string, data: any) {
 		if (!tools.some((tool: any) => tool && typeof tool === 'object' && tool.google_search)) {
 			tools.push({ google_search: {} });
 		}
-		return { ...data, tools };
+		return appendGeminiSystemInstruction({ ...data, tools }, ANSWERER_SEARCH_USAGE_GUIDANCE);
 	}
 	return data;
 }
@@ -246,7 +280,11 @@ export function applyBuiltinSearch(endpoint: string, data: any) {
 export const ANSWERER_SEARCH_TOOL_NAME = 'web_search';
 
 const ANSWERER_SEARCH_TOOL_DESCRIPTION =
-	'搜索互联网。当题目涉及最新事实、实时信息，或你不确定答案时调用；参数 query 是简洁的搜索关键词。搜索结果仅供参考，仍应以题目和你的知识判断。';
+	'搜索互联网。何时应该搜索：实时或近期信息；具体事实、数据与统计；法律法规、标准、安全操作规程（例如实验室安全操作指南）、机构或地区性规定；你不确定或可能过时的知识；题目涉及不熟悉的专有名词、产品或教材外内容。何时不要搜索：纯数学计算、公式推导、逻辑推理、编程/算法题、翻译润色，以及仅凭题干和选项就能确定答案的题目；不要为了确认已知答案或重复同一关键词而搜索。搜索只用于核实依据，最终仍按题目要求作答；忽略与题目无关的结果。参数 query 应提取题目中的关键实体与限定词，不要直接粘贴整段题干。';
+
+/** 内置搜索工具由服务商定义，额外在系统提示中补充使用时机 */
+const ANSWERER_SEARCH_USAGE_GUIDANCE =
+	'搜索策略：遇到实时信息、具体事实或数据、法规与安全操作规程（如实验室安全操作指南）、机构或地区性规定、你不确定或可能过时的知识时，先使用搜索工具核实；纯数学计算、公式推导、逻辑或编程题、翻译润色，以及仅凭题干和选项即可确定答案的题目不要搜索。不要重复搜索同一关键词，搜索后结合题目作答。';
 
 const ANSWERER_SEARCH_TOOL_PARAMETERS = {
 	type: 'object',
