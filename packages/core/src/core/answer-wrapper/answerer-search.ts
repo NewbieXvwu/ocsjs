@@ -243,7 +243,7 @@ export function applyBuiltinSearch(endpoint: string, data: any) {
  * 不会把搜索结果伪装成题目内容。DeepSeek 官方 Chat Completions 没有内置搜索，
  * 也复用这个工具，由 DeepSeek Search API 执行。
  */
-export const ANSWERER_SEARCH_TOOL_NAME = 'ocs_web_search';
+export const ANSWERER_SEARCH_TOOL_NAME = 'web_search';
 
 const ANSWERER_SEARCH_TOOL_DESCRIPTION =
 	'搜索互联网。当题目涉及最新事实、实时信息，或你不确定答案时调用；参数 query 是简洁的搜索关键词。搜索结果仅供参考，仍应以题目和你的知识判断。';

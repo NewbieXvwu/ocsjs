@@ -309,7 +309,7 @@ export async function defaultAnswerWrapperHandler(
 	// 搜索增强：不再把搜索结果预先拼进题干。
 	// - 官方 OpenAI / DeepSeek Responses、Gemini 使用各自的原生搜索工具；
 	// - 自定义搜索（以及没有原生工具的 DeepSeek Chat Completions）通过函数工具
-	//   ocs_web_search 交给模型按需调用，搜索结果以 tool/function 结果回传。
+	//   web_search 交给模型按需调用，搜索结果以 tool/function 结果回传。
 	const searchOptions = readAnswererSearchOptions(env);
 	const warnedCustomSearchEndpoints = new Set<string>();
 
