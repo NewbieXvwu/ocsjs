@@ -50,11 +50,16 @@ export function readAnswererSearchOptions(env: any): AnswererSearchOptions {
 	};
 }
 
-/** 官方 DeepSeek 模型端点（搜索使用其独立的 Search API） */
+/** 官方 DeepSeek 模型端点（Chat Completions 无内置搜索，Responses 支持 web_search） */
 export function isOfficialDeepSeekEndpoint(url: string) {
 	return /^https:\/\/api\.deepseek\.com\/v1\/(?:chat\/completions|responses|beta\/chat\/completions)(?:\?|$)/i.test(
 		String(url || '')
 	);
+}
+
+/** 官方 DeepSeek Responses 端点（支持内置 web_search 工具） */
+export function isOfficialDeepSeekResponsesEndpoint(url: string) {
+	return /^https:\/\/api\.deepseek\.com\/v1\/responses(?:\?|$)/i.test(String(url || ''));
 }
 
 /** 官方 Gemini generateContent 端点（内置 Google Search grounding） */
@@ -138,25 +143,6 @@ export function applyOpenCodeHeaders(headers: Record<string, string>, env: any) 
 	return result;
 }
 
-/** 从题目文本构造搜索词：去掉图片 URL 与占位符，避免污染检索 */
-function buildSearchQuery(env: any) {
-	const clean = (value: any) =>
-		String(value || '')
-			.replace(/https?:\/\/[^\s"'<>]+/gi, ' ')
-			.replace(/\[图片(?:\d+|尚未加载)?\]/g, ' ')
-			.replace(/\[图 ID (?:开始|结束)\]/g, ' ')
-			.replace(/\s+/g, ' ')
-			.trim();
-	const title = clean(env?.title || env?.suggestion_title || '');
-	if (!title) return '';
-	const options = clean(env?.options || '')
-		.split(/\n+/)
-		.slice(0, 4)
-		.join(' ')
-		.slice(0, 120);
-	return `${title}${options ? ' ' + options : ''}`.trim();
-}
-
 async function postSearchJson(url: string, apiKey: string, body: Record<string, any>) {
 	const response = await Promise.race([
 		request(url, {
@@ -229,75 +215,10 @@ async function searchDeepSeek(query: string, apiKey: string, maxResults: number)
 	return lines.join('\n\n');
 }
 
-const searchCache = new WeakMap<object, Map<string, Promise<string>>>();
-
-/**
- * 执行一次外部搜索并返回可注入题目的文本。同一 env + provider 只请求一次。
- * 任何失败都只在控制台告警，返回空字符串，不影响答题。
- */
-export function prepareExternalSearch(
-	env: any,
-	options: AnswererSearchOptions,
-	providerOverride?: AnswererSearchProvider
-): Promise<string> {
-	const provider = providerOverride || options.provider;
-	const envObject = env && typeof env === 'object' ? env : {};
-	let cache = searchCache.get(envObject);
-	if (!cache) {
-		cache = new Map();
-		searchCache.set(envObject, cache);
-	}
-	const cached = cache.get(provider);
-	if (cached) return cached;
-	const promise = (async () => {
-		const query = buildSearchQuery(env);
-		if (!query) return '';
-		const apiKey = String(options.keys?.[provider] || '').trim();
-		if (!apiKey) {
-			console.warn(`[OCS] 已开启 ${SEARCH_PROVIDER_LABELS[provider]} 搜索，但没有填写对应的 API Key。`);
-			return '';
-		}
-		try {
-			const maxResults = options.max_results || DEFAULT_MAX_RESULTS;
-			const body =
-				provider === 'exa'
-					? await searchExa(query, apiKey, maxResults)
-					: provider === 'tavily'
-					? await searchTavily(query, apiKey, maxResults)
-					: await searchDeepSeek(query, apiKey, maxResults);
-			if (!body) return '';
-			const header = `【网络搜索结果（${SEARCH_PROVIDER_LABELS[provider]}，仅供参考；与题目无关时请忽略，不要凭此臆造答案）】`;
-			return `${header}\n${body}`.slice(0, MAX_CONTEXT_CHARS);
-		} catch (error: any) {
-			console.warn(`[OCS] ${SEARCH_PROVIDER_LABELS[provider]} 搜索失败：`, error?.message || error);
-			return '';
-		}
-	})();
-	cache.set(provider, promise);
-	return promise;
-}
-
-/** 把搜索结果附加到题目文本与 rich_content（旧题库读 ${title}，新题库读 rich_content） */
-export function injectSearchContext(env: any, context: string) {
-	if (!context || !env || env.__searchContextInjected) return;
-	env.__searchContextInjected = true;
-	env.search_context = context;
-	if (typeof env.title === 'string') {
-		env.title = `${env.title}\n\n${context}`;
-	}
-	// 旧版图片题库读取 suggestion_title（题干 + 选项 + [图片N]），也要带上搜索结果。
-	if (typeof env.suggestion_title === 'string' && env.suggestion_title.trim()) {
-		env.suggestion_title = `${env.suggestion_title}\n\n${context}`;
-	}
-	if (Array.isArray(env.rich_content)) {
-		env.rich_content = [{ type: 'input_text', text: context }, ...env.rich_content];
-	}
-}
-
 /** 官方端点的内置搜索工具注入 */
 export function applyBuiltinSearch(endpoint: string, data: any) {
 	if (!data || typeof data !== 'object' || Array.isArray(data)) return data;
-	if (isOfficialOpenAIEndpoint(endpoint)) {
+	if (isOfficialOpenAIEndpoint(endpoint) || isOfficialDeepSeekResponsesEndpoint(endpoint)) {
 		const tools = Array.isArray(data.tools) ? data.tools.slice() : [];
 		if (!tools.some((tool: any) => tool?.type === 'web_search' || tool?.type === 'web_search_preview')) {
 			tools.push({ type: 'web_search' });
@@ -312,4 +233,268 @@ export function applyBuiltinSearch(endpoint: string, data: any) {
 		return { ...data, tools };
 	}
 	return data;
+}
+
+/**
+ * 自定义搜索使用的函数工具。
+ *
+ * 和“先把搜索结果拼进题干”不同，这里只向模型声明一个可调用的搜索工具；
+ * 模型自己决定是否搜索、用什么关键词搜索，结果通过 tool/function 角色回传，
+ * 不会把搜索结果伪装成题目内容。DeepSeek 官方 Chat Completions 没有内置搜索，
+ * 也复用这个工具，由 DeepSeek Search API 执行。
+ */
+export const ANSWERER_SEARCH_TOOL_NAME = 'ocs_web_search';
+
+const ANSWERER_SEARCH_TOOL_DESCRIPTION =
+	'搜索互联网。当题目涉及最新事实、实时信息，或你不确定答案时调用；参数 query 是简洁的搜索关键词。搜索结果仅供参考，仍应以题目和你的知识判断。';
+
+const ANSWERER_SEARCH_TOOL_PARAMETERS = {
+	type: 'object',
+	properties: {
+		query: { type: 'string', description: '搜索关键词，尽量包含题目中的关键实体与限定词' }
+	},
+	required: ['query'],
+	additionalProperties: false
+};
+
+export type AnswererSearchToolProtocol = 'openai-chat' | 'openai-responses' | 'gemini';
+
+/** 根据端点判断函数调用协议；无法识别时不注入工具 */
+export function detectSearchToolProtocol(endpoint: string): AnswererSearchToolProtocol | null {
+	const url = String(endpoint || '');
+	if (/\/v1beta\/models\/[^/?]+:generateContent(?:\?|$)/i.test(url)) return 'gemini';
+	if (/\/responses(?:\?|$)/i.test(url)) return 'openai-responses';
+	if (/\/chat\/completions(?:\?|$)/i.test(url)) return 'openai-chat';
+	return null;
+}
+
+/** 只有请求体本身能追加消息时才允许工具循环 */
+export function supportsSearchToolData(protocol: AnswererSearchToolProtocol, data: any) {
+	if (!data || typeof data !== 'object' || Array.isArray(data)) return false;
+	if (protocol === 'openai-chat') return Array.isArray(data.messages);
+	if (protocol === 'openai-responses') return Array.isArray(data.input);
+	return Array.isArray(data.contents);
+}
+
+/** 向请求体注入函数工具定义（不改动已有同名工具） */
+export function injectSearchTool(protocol: AnswererSearchToolProtocol, data: any) {
+	if (!supportsSearchToolData(protocol, data)) return data;
+	const tools = Array.isArray(data.tools) ? data.tools.slice() : [];
+	if (protocol === 'openai-chat') {
+		if (
+			!tools.some(
+				(tool: any) => tool?.type === 'function' && tool?.function && tool.function.name === ANSWERER_SEARCH_TOOL_NAME
+			)
+		) {
+			tools.push({
+				type: 'function',
+				function: {
+					name: ANSWERER_SEARCH_TOOL_NAME,
+					description: ANSWERER_SEARCH_TOOL_DESCRIPTION,
+					parameters: ANSWERER_SEARCH_TOOL_PARAMETERS
+				}
+			});
+		}
+		return { ...data, tools, tool_choice: data.tool_choice ?? 'auto' };
+	}
+	if (protocol === 'openai-responses') {
+		if (!tools.some((tool: any) => tool?.type === 'function' && tool?.name === ANSWERER_SEARCH_TOOL_NAME)) {
+			tools.push({
+				type: 'function',
+				name: ANSWERER_SEARCH_TOOL_NAME,
+				description: ANSWERER_SEARCH_TOOL_DESCRIPTION,
+				parameters: ANSWERER_SEARCH_TOOL_PARAMETERS,
+				strict: false
+			});
+		}
+		return { ...data, tools };
+	}
+	const declarations = tools.find((tool: any) => Array.isArray(tool?.functionDeclarations));
+	if (declarations) {
+		const exists = declarations.functionDeclarations.some(
+			(declaration: any) => declaration?.name === ANSWERER_SEARCH_TOOL_NAME
+		);
+		if (exists) return { ...data, tools };
+		const updated = tools.slice();
+		const index = updated.indexOf(declarations);
+		updated[index] = {
+			...declarations,
+			functionDeclarations: [
+				...declarations.functionDeclarations,
+				{
+					name: ANSWERER_SEARCH_TOOL_NAME,
+					description: ANSWERER_SEARCH_TOOL_DESCRIPTION,
+					parameters: {
+						type: 'OBJECT',
+						properties: {
+							query: { type: 'STRING', description: '搜索关键词，尽量包含题目中的关键实体与限定词' }
+						},
+						required: ['query']
+					}
+				}
+			]
+		};
+		return { ...data, tools: updated };
+	}
+	tools.push({
+		functionDeclarations: [
+			{
+				name: ANSWERER_SEARCH_TOOL_NAME,
+				description: ANSWERER_SEARCH_TOOL_DESCRIPTION,
+				parameters: {
+					type: 'OBJECT',
+					properties: {
+						query: { type: 'STRING', description: '搜索关键词，尽量包含题目中的关键实体与限定词' }
+					},
+					required: ['query']
+				}
+			}
+		]
+	});
+	return { ...data, tools };
+}
+
+export interface AnswererSearchToolCall {
+	/** OpenAI Chat / Responses 的调用 ID；Gemini 没有 ID，使用序号 */
+	id: string;
+	query: string;
+	/** 原始调用项，用于按原协议回传 */
+	raw?: any;
+}
+
+function parseSearchQuery(value: any) {
+	if (typeof value === 'string') {
+		try {
+			const parsed = JSON.parse(value);
+			return typeof parsed?.query === 'string' ? parsed.query.trim() : '';
+		} catch {
+			return '';
+		}
+	}
+	return typeof value?.query === 'string' ? value.query.trim() : '';
+}
+
+/** 从模型响应中提取搜索工具调用 */
+export function extractSearchToolCalls(protocol: AnswererSearchToolProtocol, response: any): AnswererSearchToolCall[] {
+	try {
+		if (protocol === 'openai-chat') {
+			const calls = response?.choices?.[0]?.message?.tool_calls;
+			if (!Array.isArray(calls)) return [];
+			return calls
+				.filter((call: any) => call?.type === 'function' && call?.function?.name === ANSWERER_SEARCH_TOOL_NAME)
+				.map((call: any) => ({
+					id: String(call.id || ''),
+					query: parseSearchQuery(call.function?.arguments),
+					raw: call
+				}))
+				.filter((call: AnswererSearchToolCall) => call.query);
+		}
+		if (protocol === 'openai-responses') {
+			const output = Array.isArray(response?.output) ? response.output : [];
+			return output
+				.filter((item: any) => item?.type === 'function_call' && item?.name === ANSWERER_SEARCH_TOOL_NAME)
+				.map((item: any) => ({
+					id: String(item.call_id || item.id || ''),
+					query: parseSearchQuery(item.arguments),
+					raw: item
+				}))
+				.filter((call: AnswererSearchToolCall) => call.query);
+		}
+		const parts = response?.candidates?.[0]?.content?.parts;
+		if (!Array.isArray(parts)) return [];
+		return parts
+			.filter((part: any) => part?.functionCall?.name === ANSWERER_SEARCH_TOOL_NAME)
+			.map((part: any, index: number) => ({
+				id: `gemini-${index}`,
+				query: parseSearchQuery(part.functionCall?.args),
+				raw: part
+			}))
+			.filter((call: AnswererSearchToolCall) => call.query);
+	} catch {
+		return [];
+	}
+}
+
+/** 把搜索结果按原协议回传，然后由调用方重新发送请求 */
+export function appendSearchToolResults(
+	protocol: AnswererSearchToolProtocol,
+	data: any,
+	calls: AnswererSearchToolCall[],
+	results: string[]
+) {
+	if (!calls.length) return data;
+	if (protocol === 'openai-chat') {
+		const messages = Array.isArray(data.messages) ? data.messages.slice() : [];
+		messages.push({
+			role: 'assistant',
+			content: null,
+			tool_calls: calls.map((call) => call.raw)
+		});
+		calls.forEach((call, index) => {
+			messages.push({
+				role: 'tool',
+				tool_call_id: call.id,
+				content: results[index] || '搜索没有返回结果。'
+			});
+		});
+		return { ...data, messages };
+	}
+	if (protocol === 'openai-responses') {
+		const input = Array.isArray(data.input) ? data.input.slice() : [];
+		// 使用 previous_response_id 时，服务端已经保存了上一轮输出；
+		// 再回传 function_call 项会造成重复。
+		if (!data.previous_response_id) {
+			calls.forEach((call) => {
+				if (call.raw) input.push(call.raw);
+			});
+		}
+		calls.forEach((call, index) => {
+			input.push({
+				type: 'function_call_output',
+				call_id: call.id,
+				output: results[index] || '搜索没有返回结果。'
+			});
+		});
+		return { ...data, input };
+	}
+	const contents = Array.isArray(data.contents) ? data.contents.slice() : [];
+	contents.push({
+		role: 'model',
+		parts: calls.map((call) => ({
+			functionCall: { name: ANSWERER_SEARCH_TOOL_NAME, args: { query: call.query } }
+		}))
+	});
+	contents.push({
+		role: 'user',
+		parts: calls.map((call, index) => ({
+			functionResponse: {
+				name: ANSWERER_SEARCH_TOOL_NAME,
+				response: { result: results[index] || '搜索没有返回结果。' }
+			}
+		}))
+	});
+	return { ...data, contents };
+}
+
+/** 执行一次工具搜索；失败时返回说明文本，让模型可以继续作答 */
+export async function runSearchToolQuery(
+	options: AnswererSearchOptions,
+	provider: AnswererSearchProvider,
+	query: string
+): Promise<string> {
+	const label = SEARCH_PROVIDER_LABELS[provider];
+	const apiKey = String(options.keys?.[provider] || '').trim();
+	if (!apiKey) return `搜索不可用：没有配置 ${label} 的 API Key。`;
+	try {
+		const maxResults = options.max_results || DEFAULT_MAX_RESULTS;
+		const body =
+			provider === 'exa'
+				? await searchExa(query, apiKey, maxResults)
+				: provider === 'tavily'
+				? await searchTavily(query, apiKey, maxResults)
+				: await searchDeepSeek(query, apiKey, maxResults);
+		return (body || '搜索没有返回结果。').slice(0, MAX_CONTEXT_CHARS);
+	} catch (error: any) {
+		return `搜索失败：${error?.message || error}`.slice(0, MAX_CONTEXT_CHARS);
+	}
 }

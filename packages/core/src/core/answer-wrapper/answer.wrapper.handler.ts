@@ -2,13 +2,19 @@ import { AnswererWrapper, SearchInformation, Result } from './interface';
 import { request } from '../utils/request';
 import { $ } from '../../utils';
 import {
+	appendSearchToolResults,
 	applyBuiltinSearch,
 	applyOpenCodeHeaders,
-	injectSearchContext,
+	detectSearchToolProtocol,
+	extractSearchToolCalls,
+	injectSearchTool,
 	isOfficialDeepSeekEndpoint,
+	isOfficialDeepSeekResponsesEndpoint,
 	isOpenCodeGoEndpoint,
-	prepareExternalSearch,
-	readAnswererSearchOptions
+	readAnswererSearchOptions,
+	runSearchToolQuery,
+	supportsSearchToolData,
+	type AnswererSearchProvider
 } from './answerer-search';
 
 export const AnswerWrapperHandlerConfig = {
@@ -300,15 +306,12 @@ export async function defaultAnswerWrapperHandler(
 	if (env.suggestion_title === undefined) env.suggestion_title = '';
 	if (env.suggestion_options === undefined) env.suggestion_options = '';
 
-	// 搜索增强：同一题目的多个题库共享一次外部搜索；官方 DeepSeek 使用其 Search API 作为内置搜索。
+	// 搜索增强：不再把搜索结果预先拼进题干。
+	// - 官方 OpenAI / DeepSeek Responses、Gemini 使用各自的原生搜索工具；
+	// - 自定义搜索（以及没有原生工具的 DeepSeek Chat Completions）通过函数工具
+	//   ocs_web_search 交给模型按需调用，搜索结果以 tool/function 结果回传。
 	const searchOptions = readAnswererSearchOptions(env);
-	const needsDeepSeekBuiltinSearch =
-		searchOptions.mode === 'builtin' && temp.some((wrapper) => isOfficialDeepSeekEndpoint(wrapper.url));
-	if (searchOptions.mode === 'custom' || needsDeepSeekBuiltinSearch) {
-		const provider = searchOptions.mode === 'custom' ? searchOptions.provider : 'deepseek';
-		const searchContext = await prepareExternalSearch(env, searchOptions, provider);
-		if (searchContext) injectSearchContext(env, searchContext);
-	}
+	const warnedCustomSearchEndpoints = new Set<string>();
 
 	// 多线程请求
 	await Promise.all(
@@ -331,6 +334,10 @@ export async function defaultAnswerWrapperHandler(
 					headers['Content-Type'] = 'application/json';
 				}
 			}
+			// 本项目使用的搜索工具状态（每个题库独立）
+			let useFunctionSearchTool = false;
+			let searchToolProvider: AnswererSearchProvider = 'deepseek';
+			let toolProtocol: ReturnType<typeof detectSearchToolProtocol> = null;
 			try {
 				// 答案列表
 				let results: Result[] = [];
@@ -379,6 +386,30 @@ export async function defaultAnswerWrapperHandler(
 					}
 					assertOpenAIImagesDelivered(wrapper.url, requestData, env);
 					assertGeminiImagesDelivered(wrapper.url, requestData, env);
+
+					// DeepSeek Chat Completions 没有内置搜索工具；自定义搜索则需要一个
+					// 由模型主动调用的函数工具。两者都走工具循环。
+					toolProtocol = detectSearchToolProtocol(wrapper.url);
+					const wantsFunctionTool =
+						searchOptions.mode === 'custom' ||
+						(searchOptions.mode === 'builtin' &&
+							isOfficialDeepSeekEndpoint(wrapper.url) &&
+							!isOfficialDeepSeekResponsesEndpoint(wrapper.url));
+					useFunctionSearchTool = !!(
+						wantsFunctionTool &&
+						toolProtocol &&
+						supportsSearchToolData(toolProtocol, requestData)
+					);
+					searchToolProvider = searchOptions.mode === 'custom' ? searchOptions.provider : 'deepseek';
+					if (useFunctionSearchTool && toolProtocol) {
+						requestData = injectSearchTool(toolProtocol, requestData);
+					} else if (searchOptions.mode === 'custom' && !warnedCustomSearchEndpoints.has(wrapper.url)) {
+						warnedCustomSearchEndpoints.add(wrapper.url);
+						console.warn(
+							`[OCS] 自定义搜索未执行：该题库端点无法识别函数调用协议（${wrapper.url}）。` +
+								'目前支持 OpenAI Chat Completions、OpenAI Responses 与 Gemini generateContent。'
+						);
+					}
 				} else {
 					throw new Error('不支持的请求方式');
 				}
@@ -392,22 +423,41 @@ export async function defaultAnswerWrapperHandler(
 					// 可识别的客户端标识与会话 ID，因此统一改走 GM_xmlhttpRequest。
 					requestType = 'GM_xmlhttpRequest';
 				}
-				const responseData = await Promise.race([
-					request(url.toString(), {
-						method,
-						// contentType: 历史遗留的命名问题
-						responseType: responseType || contentType,
-						data: requestData,
-						type: requestType,
-						// 请求头同样支持 ${openaiApiKey} / ${geminiApiKey} 等占位符，
-						// 避免用户把密钥直接写进题库配置（配置可能被导出或分享）。
-						headers: requestHeaders
-					}),
-					$.sleep((AnswerWrapperHandlerConfig.timeout_seconds ?? 60) * 1000)
-				]);
-				if (responseData === undefined) {
-					throw new Error('题库请求超时，可能是题库问题，或者请检查网络或者重试。');
+				const sendRequest = async (payload: any) => {
+					const response = await Promise.race([
+						request(url.toString(), {
+							method,
+							// contentType: 历史遗留的命名问题
+							responseType: responseType || contentType,
+							data: payload,
+							type: requestType,
+							// 请求头同样支持 ${openaiApiKey} / ${geminiApiKey} 等占位符，
+							// 避免用户把密钥直接写进题库配置（配置可能被导出或分享）。
+							headers: requestHeaders
+						}),
+						$.sleep((AnswerWrapperHandlerConfig.timeout_seconds ?? 60) * 1000)
+					]);
+					if (response === undefined) {
+						throw new Error('题库请求超时，可能是题库问题，或者请检查网络或者重试。');
+					}
+					return response;
+				};
+
+				let currentData = requestData;
+				let responseData = await sendRequest(currentData);
+				if (useFunctionSearchTool && toolProtocol) {
+					// 最多两轮工具调用，避免模型反复搜索导致请求数失控。
+					for (let round = 0; round < 2; round++) {
+						const toolCalls = extractSearchToolCalls(toolProtocol, responseData);
+						if (!toolCalls.length) break;
+						const toolResults = await Promise.all(
+							toolCalls.map((call) => runSearchToolQuery(searchOptions, searchToolProvider, call.query))
+						);
+						currentData = appendSearchToolResults(toolProtocol, currentData, toolCalls, toolResults);
+						responseData = await sendRequest(currentData);
+					}
 				}
+				requestData = currentData;
 
 				/** 从 handler 获取搜索到的题目和回答 */
 

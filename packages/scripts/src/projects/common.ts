@@ -827,7 +827,7 @@ export const CommonProject = Project.create({
 									h(
 										'div',
 										{ className: 'secondary' },
-										'内置搜索：OpenAI 使用 web_search，Gemini 使用 Google Search grounding，DeepSeek 使用 Search API。自定义搜索：Exa / Tavily / DeepSeek，适用于任意自定义端点。搜索失败不会中断答题。'
+										'内置搜索：OpenAI / DeepSeek Responses 使用 web_search 工具，Gemini 使用 Google Search grounding，DeepSeek Chat Completions 使用 Search API。自定义搜索通过函数工具 ocs_web_search 交由模型按需调用（Exa / Tavily / DeepSeek），搜索结果以工具结果回传，不再拼进题干。搜索失败不会中断答题。'
 									),
 									h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '8px', marginTop: '8px' } }, [
 										h('label', { style: { display: 'flex', alignItems: 'center', gap: '4px' } }, [
