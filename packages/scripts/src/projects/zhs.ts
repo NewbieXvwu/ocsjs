@@ -2830,7 +2830,7 @@ function xnkWork({ answererWrappers, period, thread, answerSeparators }: CommonW
 
 	const titleTransform = (titles: (HTMLElement | undefined)[]) => {
 		return titles
-			.filter((t) => t?.innerText)
+			.filter((t) => t?.innerText || t?.querySelector('img,canvas,svg,mjx-container'))
 			.map((t) => (t ? extractTextWithImages(t).text : ''))
 			.join(',');
 	};
@@ -2938,7 +2938,7 @@ function smartWork(
 
 	const titleTransformWithImages = (titles: (HTMLElement | undefined)[]) => {
 		const results = titles
-			.filter((t) => t?.innerText)
+			.filter((t) => t?.innerText || t?.querySelector('img,canvas,svg,mjx-container'))
 			.map((t) => (t ? extractTextWithImages(t) : { text: '', images: [] as string[] }));
 		return {
 			text: results.map((r) => r.text).join(','),
@@ -3082,7 +3082,7 @@ function smartExam(
 
 	const titleTransformWithImages = (titles: (HTMLElement | undefined)[]) => {
 		const results = titles
-			.filter((t) => t?.innerText)
+			.filter((t) => t?.innerText || t?.querySelector('img,canvas,svg,mjx-container'))
 			.map((t) => (t ? extractTextWithImages(t) : { text: '', images: [] as string[] }));
 		return {
 			text: results.map((r) => r.text).join(','),
@@ -3367,7 +3367,7 @@ function hikeWork(
 
 	const titleTransform = (titles: (HTMLElement | undefined)[]) => {
 		return titles
-			.filter((t) => t?.innerText)
+			.filter((t) => t?.innerText || t?.querySelector('img,canvas,svg,mjx-container'))
 			.map((t) => (t ? extractTextWithImages(t).text : ''))
 			.join(',');
 	};

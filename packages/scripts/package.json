@@ -28,6 +28,7 @@
 	},
 	"homepage": "https://github.com/ocsjs/ocsjs#readme",
 	"devDependencies": {
+		"@types/lodash": "^4.14.194",
 		"@types/marked": "^4.0.8",
 		"@types/md5": "^2.3.2",
 		"@types/semver": "^7.5.0",

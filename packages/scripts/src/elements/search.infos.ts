@@ -2,20 +2,19 @@ import { SimplifyWorkResult, splitAnswer, $, QuestionTypes } from '@ocsjs/core';
 import { $ui, h } from 'easy-us';
 import { createQuestionTitleExtra } from '../utils';
 import { createAccordionCard } from '../utils/ui';
-
-/**
- * 图片链接正则
- * 含 query string 与 fragment，避免 URL 被截断（如带 ?response-content-disposition=... 的鉴权链接）
- * 排除空白/引号/</CJK，避免跨越标签或吞掉相邻中文
- */
-const IMG_LINK_RE =
-	/https?:\/\/[^"'<\s一-鿿]+?\.(?:png|jpe?g|gif|bmp|webp|svg)(?:\?[^\s"'<>一-鿿]*)?(?:#[^\s"'<>一-鿿]*)?/g;
+import { imageUrlMatches } from '../utils/answerer-env';
 
 /**
  * 判断是否有图片链接，如果有则使用 <img> 标签包裹，但如果已经被 <img> 包裹则不处理
+ *
+ * 使用 imageUrlMatches 而不是简单正则：它会处理 HTML 实体（&amp;）与尾部标点，
+ * 并按 URL 长度降序替换，避免短链接是长链接子串时被提前拆开。
  */
 const transformImgLinkOfQuestion = (question: string) => {
-	const toImg = (text: string) => text.replace(IMG_LINK_RE, (img) => `<img src="${img}" />`);
+	const toImg = (text: string) => {
+		const urls = imageUrlMatches(text).sort((a, b) => b.length - a.length);
+		return urls.reduce((result, url) => result.split(url).join(`<img src="${url}" />`), text);
+	};
 
 	// 纯文本（无 img 标签）直接替换链接：
 	// 走 DOM 序列化会把 & 转义成 &amp;（其中的分号会被答案分隔符 ';' 误切碎 img 标签），

@@ -6,6 +6,8 @@ import {
 	AnswererWrapper,
 	SearchInformation,
 	WorkContext,
+	QuestionDocument,
+	QuestionPart,
 	$
 } from '@ocsjs/core';
 import { $ui, $message, MessageElement, Script, h, CommonEventEmitter, cors, $elements } from 'easy-us';
@@ -19,8 +21,22 @@ import {
 	createImageSuggestion,
 	imageToBase64,
 	ImageSuggestionResult,
+	isAnswererWrapperSupportImageOptimize,
 	isAnswererWrappersSupportImageOptimize
 } from './answerer-env';
+import {
+	appendQuestionPart,
+	hasQuestionMedia,
+	makeQuestionIR,
+	normalizeQuestionTransform,
+	normalizeQuestionWords,
+	questionElementBox,
+	questionTextNodeBox,
+	questionTextPart,
+	splitLegacyQuestionText,
+	summarizeQuestionParts
+} from './question-ir';
+import { canonicalImageUrl } from './image-url';
 
 // 重新导出，保持对外 API 不变（common.ts / exploration.ts 等仍从本文件导入）
 export {
@@ -438,50 +454,230 @@ export interface ExtractTextOptions {
 	/** 仅收集满足条件的 img（如 zhs 选项需排除按钮图片） */
 	imgFilter?: (img: HTMLImageElement) => boolean;
 }
-export function extractTextWithImages(
-	root: HTMLElement,
-	opts?: ExtractTextOptions
-): { text: string; images: string[] } {
-	const parts: string[] = [];
-	const images: string[] = [];
+
+/** 解析 img 的真实地址，兼容懒加载属性与 srcset */
+function resolveImageElementUrl(img: HTMLImageElement): string {
+	const lazyAttrs = ['data-src', 'data-original', 'data-lazy-src', 'data-actualsrc', 'data-url'];
+	const lazy = lazyAttrs.map((name) => canonicalImageUrl(img.getAttribute(name))).find(Boolean) || '';
+	const loaded =
+		img.complete && (img.naturalWidth > 0 || img.naturalHeight > 0) ? canonicalImageUrl(img.currentSrc || img.src) : '';
+	if (loaded && (!lazy || img.naturalWidth > 2)) return loaded;
+	if (lazy) return lazy;
+	if (loaded) return loaded;
+	const srcset = img.getAttribute('srcset') || '';
+	for (const candidate of srcset.split(',')) {
+		const url = canonicalImageUrl(candidate.trim().split(/\s+/)[0]);
+		if (url && !url.startsWith('data:')) return url;
+	}
+	return canonicalImageUrl(img.getAttribute('src')) || loaded;
+}
+
+/** 只把有实际图形内容的 SVG 当作题目图片；图标/箭头等装饰性 SVG 跳过 */
+function isMeaningfulQuestionSvg(svg: SVGElement): boolean {
+	if (svg.closest('mjx-container, .MathJax, .katex, math')) return true;
+	const classes = `${svg.getAttribute('class') || ''} ${svg.parentElement?.getAttribute('class') || ''}`;
+	if (svg.getAttribute('aria-hidden') === 'true') return false;
+	if (svg.getAttribute('role') === 'presentation') return false;
+	if (/icon|arrow|check|radio|checkbox|chevron/i.test(classes)) return false;
+	if (svg.getAttribute('role') === 'img') return true;
+	const viewBox = (svg.getAttribute('viewBox') || '')
+		.trim()
+		.split(/[\s,]+/)
+		.map(Number);
+	if (viewBox.length === 4 && Number.isFinite(viewBox[2]) && Number.isFinite(viewBox[3])) {
+		if (viewBox[2] <= 24 || viewBox[3] <= 24) return false;
+	}
+	return !!svg.querySelector('path,image,text,use,rect,circle,line,polyline,polygon');
+}
+
+function svgToDataUrl(svg: SVGElement): string {
+	const clone = svg.cloneNode(true) as SVGElement;
+	if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+	const viewBox = svg.getAttribute('viewBox');
+	if (viewBox && !clone.getAttribute('width') && !clone.getAttribute('height')) {
+		const [, , w, h] = viewBox
+			.trim()
+			.split(/[\s,]+/)
+			.map(Number);
+		if (w > 0 && h > 0) {
+			clone.setAttribute('width', String(w));
+			clone.setAttribute('height', String(h));
+		}
+	}
+	return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(new XMLSerializer().serializeToString(clone))}`;
+}
+
+/**
+ * 结构化 DOM 遍历：提取文本与图片节点，得到 QuestionDocument（parts/text/images/missingImages）。
+ *
+ * - 不改造 DOM、不读 innerText、不用正则提取图片。
+ * - `text` 产出原始 URL 文本（URL 两侧加空格分隔，避免相邻 URL 拼接）。
+ * - 图片保留文档顺序、坐标与来源，供 QuestionIR 分配 ID、布局与多模态传输。
+ * - 跳过 `display:none` / `visibility:hidden` 的元素（模拟 innerText 对非渲染节点的跳过）。
+ * - 对 detached 元素（如 zhs 由 JSON HTML 构建的 div）同样适用。
+ * - MathJax 公式（mjx-container）线性化为纯文本（见 {@link extractMathJaxText}）。
+ */
+export function extractTextWithImages(root: HTMLElement, opts?: ExtractTextOptions): QuestionDocument {
+	const parts: QuestionPart[] = [];
 	const walk = (node: Node) => {
 		if (node.nodeType === Node.TEXT_NODE) {
-			parts.push(node.textContent || '');
+			appendQuestionPart(parts, questionTextPart(node.textContent || '', questionTextNodeBox(node)));
 			return;
 		}
 		if (node.nodeType !== Node.ELEMENT_NODE) return;
 		const el = node as HTMLElement;
-		if (el.tagName === 'IMG') {
+		const tag = el.tagName;
+		if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'NOSCRIPT' || tag === 'TEMPLATE') return;
+		if (tag === 'IMG') {
 			const img = el as HTMLImageElement;
 			if (opts?.imgFilter && !opts.imgFilter(img)) return;
-			const url = img.src;
+			const url = resolveImageElementUrl(img);
 			if (url) {
-				parts.push(` ${url} `);
-				images.push(url);
+				appendQuestionPart(parts, { kind: 'image', url, box: questionElementBox(img) ?? undefined, origin: 'img' });
+			} else {
+				appendQuestionPart(parts, {
+					kind: 'missing-image',
+					reason: 'IMG 缺少有效资源',
+					box: questionElementBox(img) ?? undefined
+				});
 			}
 			return;
 		}
 		// MathJax v3 SVG 公式（zhs 等平台公式题的新渲染方式）：线性化为纯文本，不再递归内部 SVG
-		if (el.tagName === 'MJX-CONTAINER') {
+		if (tag === 'MJX-CONTAINER') {
 			const formula = extractMathJaxText(el);
-			if (formula) parts.push(` ${formula} `);
+			if (formula) appendQuestionPart(parts, questionTextPart(` ${formula} `));
 			return;
 		}
-		if (el.tagName === 'BR') {
-			parts.push('\n');
+		if (tag === 'BR') {
+			appendQuestionPart(parts, questionTextPart('\n'));
 			return;
 		}
-		// 跳过 display:none（仅对已挂载元素；detached 元素 getComputedStyle 返回空，不跳过）
+		if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
+		if (tag === 'CANVAS') {
+			const canvas = el as HTMLCanvasElement;
+			try {
+				if (!canvas.width || !canvas.height) throw new Error('画布尺寸为空');
+				appendQuestionPart(parts, {
+					kind: 'image',
+					url: canvas.toDataURL('image/png'),
+					box: questionElementBox(canvas) ?? undefined,
+					origin: 'canvas'
+				});
+			} catch {
+				appendQuestionPart(parts, {
+					kind: 'missing-image',
+					reason: 'Canvas 无法截图',
+					box: questionElementBox(canvas) ?? undefined
+				});
+			}
+			return;
+		}
+		if (tag === 'SVG') {
+			const svg = el as unknown as SVGElement;
+			if (!isMeaningfulQuestionSvg(svg)) return;
+			try {
+				appendQuestionPart(parts, {
+					kind: 'image',
+					url: svgToDataUrl(svg),
+					box: questionElementBox(svg) ?? undefined,
+					origin: 'svg'
+				});
+			} catch {
+				appendQuestionPart(parts, {
+					kind: 'missing-image',
+					reason: 'SVG 无法序列化',
+					box: questionElementBox(svg) ?? undefined
+				});
+			}
+			return;
+		}
+		// 跳过 display:none / visibility:hidden（仅对已挂载元素；detached 元素 getComputedStyle 返回空，不跳过）
 		try {
 			const view = el.ownerDocument?.defaultView;
-			if (view && el.isConnected && view.getComputedStyle(el).display === 'none') return;
+			if (view && el.isConnected) {
+				const style = view.getComputedStyle(el);
+				if (style.display === 'none' || style.visibility === 'hidden') return;
+			}
 		} catch {
 			// 忽略
 		}
 		for (const child of Array.from(el.childNodes)) walk(child);
 	};
 	walk(root);
-	return { text: parts.join(''), images };
+	return summarizeQuestionParts(parts);
+}
+
+/** 选项仅剩标签（A./①）时可继续查找 CSS 背景图 */
+const CHOICE_LABEL_ONLY = /^(?:[A-Z]{1,2}|[①②③④⑤⑥⑦⑧])\s*[.．、:：)）]?$/i;
+
+function imageUrlFromCssBackground(el: HTMLElement): string {
+	try {
+		const view = el.ownerDocument?.defaultView;
+		if (!view) return '';
+		const style = view.getComputedStyle(el);
+		if (style.display === 'none' || style.visibility === 'hidden') return '';
+		const rect = el.getBoundingClientRect();
+		if (rect.width < 24 || rect.height < 24) return '';
+		const match = /url\((['"]?)(.*?)\1\)/i.exec(style.backgroundImage || '');
+		return match ? canonicalImageUrl(match[2]) : '';
+	} catch {
+		return '';
+	}
+}
+
+/**
+ * 平台返回值（string / {text, images}）缺少图片节点时，用真实 DOM 补齐。
+ * DOM 与平台文本一致时以 DOM 为准（这样图片才能拿到坐标与文档顺序）。
+ */
+function augmentMissingQuestionMedia(result: any, nodes: (HTMLElement | null | undefined)[]): QuestionDocument {
+	const given = normalizeQuestionTransform(result);
+	// 已带 parts / 显式 images 的结果由平台自行保证顺序，不再用 DOM 重新推断。
+	if (result && typeof result === 'object' && (Array.isArray(result.parts) || Array.isArray(result.images))) {
+		return given;
+	}
+	const domParts: QuestionPart[] = [];
+	for (const node of nodes) {
+		if (!node) continue;
+		for (const part of extractTextWithImages(node).parts) appendQuestionPart(domParts, part);
+	}
+	const dom = summarizeQuestionParts(domParts);
+	if (!hasQuestionMedia(dom)) return given;
+	const recombined = splitLegacyQuestionText(given.text || '', dom.images);
+	const givenWords = normalizeQuestionWords(recombined.text);
+	if (!givenWords) return dom;
+	const domWords = normalizeQuestionWords(dom.text);
+	if (givenWords === domWords || domWords.includes(givenWords)) return dom;
+	// 平台文本与 DOM 文本不一致：保留平台文本，仅补齐其中没有的图片。
+	const parts: QuestionPart[] = [...recombined.parts];
+	for (const part of dom.parts) {
+		if (part.kind === 'image' && !recombined.images.includes(part.url)) appendQuestionPart(parts, part);
+	}
+	return summarizeQuestionParts(parts);
+}
+
+/** 提取单个选项文档；图片选项可能只有 CSS 背景图或空文本 */
+function extractChoiceDocument(node: HTMLElement, override?: any): QuestionDocument {
+	const doc = override === undefined ? extractTextWithImages(node) : augmentMissingQuestionMedia(override, [node]);
+	if (hasQuestionMedia(doc)) return doc;
+	const semantic = `${node.className || ''} ${node.getAttribute('role') || ''}`;
+	if (!CHOICE_LABEL_ONLY.test(doc.text.trim()) && !/image|picture|photo|diagram|thumbnail|figure|pic/i.test(semantic)) {
+		return doc;
+	}
+	const parts: QuestionPart[] = [...doc.parts];
+	const candidates = [node, ...Array.from(node.querySelectorAll<HTMLElement>('*')).slice(0, 40)];
+	for (const el of candidates) {
+		const url = imageUrlFromCssBackground(el);
+		if (url && !parts.some((p) => p.kind === 'image' && p.url === url)) {
+			appendQuestionPart(parts, {
+				kind: 'image',
+				url,
+				box: questionElementBox(el) ?? undefined,
+				origin: 'css-background'
+			});
+		}
+	}
+	return summarizeQuestionParts(parts);
 }
 
 /**
@@ -570,97 +766,109 @@ export const closeAnswerWrapperEmptyWarning = cors.defineTopFunction(() => {
 });
 
 /**
- * 创建通用的 answerer 回调，封装搜题缓存、延迟、env 构建、AI 图片建议等公共逻辑
- * @param options.titleTransform 标题转换函数，接收 (elements, ctx)，返回字符串标题
- * @param options.optionsTransform 选项转换函数（可选），接收 (elements, ctx)，返回选项文本字符串；
- *   默认取 ctx.elements.options 的 innerText 拼接
+ * 创建通用的 answerer 回调，封装搜题缓存、延迟、QuestionIR 构建与多模态题库选择。
+ *
+ * - 题干/选项优先从真实 DOM 提取（含图片、坐标、顺序），平台自定义文本仅作补充。
+ * - 图片题必须开启「图片题优化」且题库为支持图片的 POST 配置，否则直接报错，绝不静默降级。
+ * - 图片题的缓存不可靠（不同图片可以同名），因此跳过缓存；纯文本题仍走缓存。
+ *
+ * @param options.titleTransform 标题转换函数，接收 (elements, ctx)，返回字符串或 {text, images}
+ * @param options.optionsTransform 选项转换函数（可选），仅用于与选项 DOM 做一致性校验
+ * @param options.choiceTransform 单个选项的转换函数（可选），返回字符串或 {text, images}
  * @param options.answererWrappers 题库配置
  * @param options.period 搜题间隔（秒），默认 3
  */
 export function createCommonAnswerer(options: {
 	titleTransform: (elements: any, ctx: WorkContext<any>) => string | { text: string; images?: string[] };
 	optionsTransform?: (elements: any, ctx: WorkContext<any>) => string | { text: string; images?: string[] };
+	choiceTransform?: (
+		node: HTMLElement,
+		index: number,
+		ctx: WorkContext<any>
+	) => string | { text: string; images?: string[] } | undefined;
 	answererWrappers: AnswererWrapper[];
 	period?: number;
 }) {
+	/** 同一脚本内图片错误只提示一次，避免逐题刷屏 */
+	let mediaErrorWarned = false;
 	const normalize = (
 		v: string | { text: string; images?: string[] } | undefined
 	): { text: string; images?: string[] } => {
 		if (v == null) return { text: '' };
 		return typeof v === 'string' ? { text: v } : v;
 	};
-	/** 题目文本中的图片 URL 快速检测（仅用于降级提示，非精确提取；无 /g 标志，test 调用安全） */
-	const QUESTION_IMAGE_REGEX = /https?:\/\/[^\s]+?\.(?:png|jpe?g|gif|bmp|webp|svg)/i;
-	/** 降级提示仅每次会话提示一次，避免逐题刷屏 */
-	let imageOptimizeOffWarned = false;
-	let imageConvertFailWarned = false;
 
 	return async (elements: any, ctx: WorkContext<any>): Promise<SearchInformation[]> => {
-		const titleResult = normalize(options.titleTransform(elements, ctx));
-		const title = titleResult.text;
-		if (!title) {
-			throw new Error('题目为空，请查看题目是否为空，或者忽略此题');
+		const titleNodes: HTMLElement[] = (elements.title ?? []).filter((node: any) => node && node.nodeType === 1);
+		const stem = augmentMissingQuestionMedia(options.titleTransform(elements, ctx), titleNodes);
+		if (!stem.text.trim() && !hasQuestionMedia(stem)) {
+			throw new Error('题干没有文字或图片，无法继续答题');
 		}
-		const titleImages = titleResult.images;
 
-		return await BackgroundProject.scripts.data.methods.searchAnswerInCaches(title, async () => {
-			await $.sleep((options.period ?? 3) * 1000);
-			const optResult = normalize(
-				options.optionsTransform
-					? options.optionsTransform(elements, ctx)
-					: (ctx.elements.options ?? [])
-							.filter(Boolean)
-							.map((o: HTMLElement | undefined) => o!.innerText)
-							.join('\n')
-			);
-			const questionHasImages =
-				(titleImages?.length ?? 0) + (optResult.images?.length ?? 0) > 0 ||
-				QUESTION_IMAGE_REGEX.test(title) ||
-				QUESTION_IMAGE_REGEX.test(optResult.text);
-			// 题目含图片但未开启图片题优化：此前为静默降级（原始 URL 发出后大概率搜不到），显式提示用户开启
-			if (questionHasImages && !CommonProject.scripts.settings.cfg.imageOptimize && !imageOptimizeOffWarned) {
-				imageOptimizeOffWarned = true;
-				$message.warn({
-					content: '检测到题目包含图片，但未开启「图片题优化」（通用-全局设置-高级设置中开启），图片题将无法搜题。',
-					duration: 10
-				});
-			}
-			const { env, imageUrls } = await buildAnswererEnv({
-				type: ctx.type,
-				title,
-				options: optResult.text,
-				titleImages,
-				optionsImages: optResult.images,
-				enableImageOptimize: CommonProject.scripts.settings.cfg.imageOptimize
-			});
-			// 已开启优化但全部图片转换失败（CORS/防盗链极端情况）：此前静默回退普通题，显式提示
-			if (
-				questionHasImages &&
-				CommonProject.scripts.settings.cfg.imageOptimize &&
-				imageUrls.length === 0 &&
-				!imageConvertFailWarned
-			) {
-				imageConvertFailWarned = true;
-				$message.warn({
-					content: '题目图片下载或转换失败（可能跨域受限），本题将按普通题目搜索，图片题可能无法匹配。',
-					duration: 10
-				});
-			}
-			const searchInfos = await defaultAnswerWrapperHandler(options.answererWrappers, env);
-			// 将 AI 答案中的 [图片N] 占位符还原为对应图片 URL，使选项匹配可以命中图片选项。
-			// imageUrls 与实际上传的 env.images 严格同序（createImageSuggestion 单一数据源，含转换失败过滤）。
-			// 覆盖服务端未还原的场景：标题图占位符 / 选项行数不对齐 / 第三方题库。
-			if (imageUrls.length) {
-				for (const info of searchInfos) {
-					for (const res of info.results) {
-						if (res.answer && res.answer.includes('[图片')) {
-							res.answer = res.answer.replace(/\[图片(\d+)\]/g, (m, n) => imageUrls[Number(n) - 1] ?? m);
-						}
-					}
-				}
-			}
-			return searchInfos;
+		const optionNodes: HTMLElement[] = (elements.options ?? []).filter((node: any) => node && node.nodeType === 1);
+		const legacyOptions = normalize(
+			options.optionsTransform
+				? options.optionsTransform(elements, ctx)
+				: optionNodes.map((node) => node.innerText).join('\n')
+		);
+		const choiceDocs = optionNodes.map((node, index) =>
+			extractChoiceDocument(node, options.choiceTransform?.(node, index, ctx))
+		);
+
+		// 选项文本聚合后出现、但无法归属到具体选项的图片，不能猜测归属。
+		const legacyDoc = normalizeQuestionTransform(legacyOptions);
+		const legacyMediaCount = legacyDoc.parts.filter((part) => part.kind !== 'text').length;
+		const optionMediaCount = choiceDocs.reduce(
+			(sum, doc) => sum + doc.parts.filter((part) => part.kind !== 'text').length,
+			0
+		);
+		if (legacyMediaCount > optionMediaCount) {
+			throw new Error(`选项中有 ${legacyMediaCount - optionMediaCount} 张图片无法确定属于哪个选项，已停止答题`);
+		}
+		if (legacyDoc.missingImages > 0 && !choiceDocs.some((doc) => doc.missingImages > 0)) {
+			throw new Error('平台解析到选项有图片未加载，已停止答题');
+		}
+
+		const ir = makeQuestionIR({
+			type: ctx.type,
+			stem,
+			choices: choiceDocs,
+			optionNodes,
+			stemNodes: titleNodes
 		});
+		ctx.questionIR = ir;
+
+		const imageOptimize = !!CommonProject.scripts.settings.cfg.imageOptimize;
+		const hasMedia = ir.hasMedia || ir.missingImages > 0;
+		if (hasMedia && !imageOptimize) {
+			throw new Error('图片题必须开启全局设置中的「图片题优化」，本题已取消纯文本发送');
+		}
+
+		let wrappers = options.answererWrappers;
+		if (hasMedia) {
+			wrappers = wrappers.filter(isAnswererWrapperSupportImageOptimize);
+			if (wrappers.length === 0) {
+				throw new Error('当前题库配置没有上传图片，请配置支持 images 或 rich_content 的多模态 POST 请求');
+			}
+		}
+
+		const search = async (): Promise<SearchInformation[]> => {
+			await $.sleep((options.period ?? 3) * 1000);
+			try {
+				const { env } = await buildAnswererEnv({ question: ir, enableImageOptimize: imageOptimize });
+				return await defaultAnswerWrapperHandler(wrappers, env);
+			} catch (e: any) {
+				if (!mediaErrorWarned) {
+					mediaErrorWarned = true;
+					$message.warn({ content: e?.message || String(e), duration: 10 });
+				}
+				throw e;
+			}
+		};
+
+		// 不同图片可以拥有相同题干文字，图片题不能使用文本缓存。
+		if (hasMedia) return await search();
+		return await BackgroundProject.scripts.data.methods.searchAnswerInCaches(stem.text.trim(), search);
 	};
 }
 

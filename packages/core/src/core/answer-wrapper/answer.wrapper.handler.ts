@@ -8,6 +8,216 @@ export const AnswerWrapperHandlerConfig = {
 };
 
 /**
+ * 旧版 OCS OpenAI 请求体只有一段 input_text + 若干 input_image。
+ * 当题库仍使用这种结构时，把它升级为按题目顺序排列的 rich_content，
+ * 其他服务商的请求结构保持原样，已保存的用户配置不会被覆盖。
+ */
+export function upgradeLegacyOpenAIMediaRequest(endpoint: string, data: any, env: any) {
+	if (
+		!/(?:^|\/)responses(?:\?.*)?$/i.test(endpoint || '') ||
+		!Array.isArray(env.rich_content) ||
+		!Array.isArray(env.images)
+	) {
+		return data;
+	}
+	const input = data && data.input;
+	if (!Array.isArray(input) || !input.length || !Array.isArray(input[0].content)) return data;
+	const blocks = input[0].content;
+	if (
+		blocks.length !== env.images.length + 1 ||
+		blocks[0].type !== 'input_text' ||
+		!blocks
+			.slice(1)
+			.every((block: any, index: number) => block.type === 'input_image' && block.image_url === env.images[index])
+	) {
+		return data;
+	}
+	const title = env.suggestion_title || env.title;
+	const startOfQuestion = blocks[0].text.indexOf('问题：' + title);
+	if (startOfQuestion < 0) return data;
+	const intro = blocks[0].text.slice(0, startOfQuestion);
+	const first = {
+		...input[0],
+		content: [...(intro ? [{ type: 'input_text', text: intro }] : []), ...env.rich_content]
+	};
+	return { ...data, input: [first, ...input.slice(1)] };
+}
+
+/** 官方 OpenAI Responses 接口 */
+export function isOfficialOpenAIResponses(url: string) {
+	return /^https:\/\/api\.openai\.com\/v1\/responses(?:\?|$)/i.test(String(url || ''));
+}
+
+/** Gemini 原生 generateContent 接口 */
+export function isGeminiNativeEndpoint(url: string) {
+	return /\/v1beta\/models\/[^/?]+:generateContent(?:\?|$)/i.test(String(url || ''));
+}
+
+/** 是否会返回图像引用依据的接口 */
+export function isImageEvidenceEndpoint(url: string) {
+	return isOfficialOpenAIResponses(url) || isGeminiNativeEndpoint(url);
+}
+
+/**
+ * OpenAI Responses 与 Gemini 原生接口都把回答放在 JSON 里，但位置不同。
+ * 图像依据校验和解析器只需要文本。
+ */
+export function readAnswererResponseText(endpoint: string, response: any): string {
+	if (!response || typeof response !== 'object') return '';
+	if (isGeminiNativeEndpoint(endpoint)) {
+		const candidate = Array.isArray(response.candidates) ? response.candidates[0] : null;
+		const parts = candidate && candidate.content && candidate.content.parts;
+		return Array.isArray(parts)
+			? parts.map((p: any) => (p && typeof p.text === 'string' ? p.text : '')).join('\n')
+			: '';
+	}
+	const outputs = Array.isArray(response.output) ? response.output : [];
+	const content = outputs
+		.filter((o: any) => o.type === 'message')
+		.flatMap((m: any) => (Array.isArray(m.content) ? m.content : []));
+	return typeof response.output_text === 'string' && response.output_text
+		? response.output_text
+		: content
+				.filter((c: any) => c.type === 'output_text')
+				.map((c: any) => c.text)
+				.join('\n');
+}
+
+/**
+ * 旧版保存的 OpenAI 题库可能没有要求模型返回图像引用信息。
+ * 仅当用户仍使用官方 Responses 接口、且 schema 仍是 OCS 的选择题结构时，
+ * 在发往模型的指令中补充说明，不修改用户本地保存的配置。
+ */
+export function upgradeSavedChoiceInstructions(endpoint: string, data: any, env: any) {
+	if (
+		!env ||
+		!env.images ||
+		!env.images.length ||
+		!env.choice_ids ||
+		!env.choice_ids.length ||
+		!isOfficialOpenAIResponses(endpoint)
+	) {
+		return data;
+	}
+	const input = data && data.input;
+	if (!Array.isArray(input)) return data;
+	let changed = false;
+	const guidance =
+		'选择题请按唯一选项代号作答。若为图片题，请在 used_image_ids 中逐项列出用于判断的图像ID（例如 Q-1、A-1），图片对应关系以图像前的ID和所属选项边界为准。如有任何图无法对应或看不清，设置 ambiguous=true；否则 false。只引用实际存在的图像ID，勿臆造。';
+	const mappedInput = input.map((message: any) => {
+		if (message.role !== 'user' || !Array.isArray(message.content)) return message;
+		const blocks = message.content;
+		const first = blocks.findIndex((block: any) => block.type === 'input_text' && typeof block.text === 'string');
+		if (first < 0 || /used_image_ids/.test(blocks[first].text)) return message;
+		const updated = blocks.slice();
+		updated[first] = { ...blocks[first], text: guidance + '\n' + blocks[first].text };
+		changed = true;
+		return { ...message, content: updated };
+	});
+	const result = changed ? { ...data, input: mappedInput } : data;
+	const format = result && result.text && result.text.format;
+	const schema = format && format.schema;
+	if (
+		!format ||
+		format.name !== 'ocs_quiz_response' ||
+		!schema ||
+		schema.type !== 'object' ||
+		!schema.properties ||
+		!schema.properties.answers
+	) {
+		return result;
+	}
+	const original = schema.properties;
+	const originalDescription = original.answers && original.answers.items && original.answers.items.description;
+	const answers =
+		typeof originalDescription === 'string' && /正确选项的完整文本/.test(originalDescription)
+			? {
+					...original.answers,
+					items: {
+						...original.answers.items,
+						description: '选择题答案数组必须写选项代号（如 A、C），图片选项同样如此；填空题写文字。'
+					}
+			  }
+			: original.answers;
+	const properties = {
+		...original,
+		answers,
+		used_image_ids: {
+			type: 'array',
+			items: { type: 'string' },
+			description: '实际用于识别并判断本题的图片ID，例如 Q-1、A-1。无图片时返回空数组。不能编造。'
+		},
+		ambiguous: { type: 'boolean', description: '任一必要图片模糊、归属不明、不能确定答案时为 true。' }
+	};
+	const required = [...new Set([...(schema.required || Object.keys(original)), 'used_image_ids', 'ambiguous'])];
+	return {
+		...result,
+		text: {
+			...result.text,
+			format: { ...format, schema: { ...schema, properties, required } }
+		}
+	};
+}
+
+/** 从原始响应中读取模型输出的图像引用依据 */
+export function readAnswererImageEvidence(endpoint: string, response: any) {
+	try {
+		const raw = readAnswererResponseText(endpoint, response);
+		if (!raw) return null;
+		const parsed = JSON.parse(raw);
+		if (!parsed || typeof parsed !== 'object') return null;
+		const ids = parsed.used_image_ids;
+		const answers = parsed.answers;
+		return {
+			complete:
+				Array.isArray(ids) &&
+				ids.every((i: any) => typeof i === 'string') &&
+				typeof parsed.ambiguous === 'boolean' &&
+				Array.isArray(answers),
+			ids: Array.isArray(ids) ? ids : [],
+			ambiguous: parsed.ambiguous,
+			answers: Array.isArray(answers) ? answers.map((v: any) => String(v).trim()) : []
+		};
+	} catch {
+		return null;
+	}
+}
+
+/** 校验 OpenAI 请求体确实携带了全部图片，避免发送“缺图”的题目 */
+export function assertOpenAIImagesDelivered(endpoint: string, data: any, env: any) {
+	if (!env || !env.images || !env.images.length || !isOfficialOpenAIResponses(endpoint)) return;
+	const content = Array.isArray(data && data.input)
+		? data.input.flatMap((message: any) => (Array.isArray(message.content) ? message.content : []))
+		: [];
+	const images = content
+		.filter((block: any) => block && block.type === 'input_image')
+		.map((block: any) => block.image_url);
+	if (images.length !== env.images.length || images.some((image: any, i: number) => image !== env.images[i])) {
+		throw new Error(`OpenAI 图片请求不完整：应有 ${env.images.length} 张，实际 ${images.length} 张。已停止答题。`);
+	}
+}
+
+function dataUrlBase64(dataUrl: string) {
+	const comma = String(dataUrl || '').indexOf(',');
+	return comma < 0 ? '' : String(dataUrl).slice(comma + 1);
+}
+
+/** 校验 Gemini 请求体确实携带了全部图片 */
+export function assertGeminiImagesDelivered(endpoint: string, data: any, env: any) {
+	if (!env || !env.images || !env.images.length || !isGeminiNativeEndpoint(endpoint)) return;
+	const parts = Array.isArray(data && data.contents)
+		? data.contents.flatMap((content: any) => (Array.isArray(content.parts) ? content.parts : []))
+		: [];
+	const images = parts.filter((part: any) => part && part.inlineData).map((part: any) => part.inlineData.data);
+	if (
+		images.length !== env.images.length ||
+		images.some((payload: any, i: number) => payload !== dataUrlBase64(env.images[i]))
+	) {
+		throw new Error(`Gemini 图片请求不完整：应有 ${env.images.length} 张，实际 ${images.length} 张。已停止答题。`);
+	}
+}
+
+/**
  *
  * 默认题库配置解析器
  *
@@ -142,6 +352,10 @@ export async function defaultAnswerWrapperHandler(
 					});
 
 					requestData = data;
+					requestData = upgradeLegacyOpenAIMediaRequest(wrapper.url, requestData, env);
+					requestData = upgradeSavedChoiceInstructions(wrapper.url, requestData, env);
+					assertOpenAIImagesDelivered(wrapper.url, requestData, env);
+					assertGeminiImagesDelivered(wrapper.url, requestData, env);
 				} else {
 					throw new Error('不支持的请求方式');
 				}
@@ -154,7 +368,9 @@ export async function defaultAnswerWrapperHandler(
 						responseType: responseType || contentType,
 						data: requestData,
 						type,
-						headers: JSON.parse(JSON.stringify(headers || {}))
+						// 请求头同样支持 ${openaiApiKey} / ${geminiApiKey} 等占位符，
+						// 避免用户把密钥直接写进题库配置（配置可能被导出或分享）。
+						headers: resolvePlaceHolder(JSON.parse(JSON.stringify(headers || {})))
 					}),
 					$.sleep((AnswerWrapperHandlerConfig.timeout_seconds ?? 60) * 1000)
 				]);
@@ -186,6 +402,15 @@ export async function defaultAnswerWrapperHandler(
 							answer: info[1],
 							extra_data: info[2] || {}
 						});
+					}
+				}
+
+				// 图片题：把原始响应中的图像引用依据挂到每条结果上，
+				// 供 question.resolver 在真正点击选项前做一致性校验。
+				if (env.image_ids && env.image_ids.length && isImageEvidenceEndpoint(wrapper.url)) {
+					const evidence = readAnswererImageEvidence(wrapper.url, responseData);
+					for (const res of results) {
+						res.extra_data = { ...(res.extra_data || {}), image_evidence: evidence };
 					}
 				}
 
@@ -221,7 +446,7 @@ export async function defaultAnswerWrapperHandler(
 				const value: any = env[placeHolder.replace(/\${(.*)}/, '$1')];
 				data = data.replace(placeHolder, options?.encodeURI ? encodeURIComponent(value) : value);
 			});
-		} else if (typeof data === 'object') {
+		} else if (data !== null && typeof data === 'object') {
 			// 递归替换
 			const keys = Object.keys(data);
 			for (const key of keys) {

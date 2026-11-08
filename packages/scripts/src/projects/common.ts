@@ -18,9 +18,10 @@ import {
 	createAnswererWrappersSignature,
 	isAnswererWrappersSupportImageOptimize
 } from '../utils/work';
-import { IMAGE_URL_REGEX } from '../utils/answerer-env';
+import { imageUrlMatches } from '../utils/answerer-env';
 import { getAnswererConfigProvider, openAnswererConnect, waitForAnswererConfig } from '../utils/answerer-connect';
 import { confirmRiskyAnswerWrappers } from '../utils/answer-wrapper-security';
+import { readAnswererApiKeys, saveAnswererApiKey } from '../utils/answerer-api-keys';
 import { initEdgeMinimize } from '../utils/edge-minimize';
 import {
 	createAnswererWrapperSection,
@@ -41,19 +42,38 @@ const TAB_WORK_RESULTS_KEY = 'common.work-results.results';
  */
 function formatQuestionForMessage(question: string): string {
 	if (!question) return question;
-	// 使用局部实例，避免共享正则（带 g 标志）的 lastIndex 状态互相干扰
-	const re = new RegExp(IMAGE_URL_REGEX.source, IMAGE_URL_REGEX.flags);
+	// 使用局部实例，避免共享正则（带 g 标志）的 lastIndex 状态互相干扰；
+	// imageUrlMatches 还会处理 HTML 实体（&amp;）与尾部标点。
+	const urls = imageUrlMatches(question);
 	const placeholderMap = new Map<string, string>();
-	let counter = 0;
-	return question.replace(re, (url) => {
-		let p = placeholderMap.get(url);
-		if (!p) {
-			counter++;
-			p = `[图片${counter}]`;
-			placeholderMap.set(url, p);
-		}
-		return p;
+	urls.forEach((url) => {
+		if (!placeholderMap.has(url)) placeholderMap.set(url, `[图片${placeholderMap.size + 1}]`);
 	});
+	// 长 URL 优先替换，避免短 URL 是长 URL 子串时被提前拆开
+	return [...placeholderMap.keys()]
+		.sort((a, b) => b.length - a.length)
+		.reduce((text, url) => text.split(url).join(placeholderMap.get(url) as string), question);
+}
+
+/**
+ * 题库配置弹窗中的 API 密钥输入框。
+ * 密钥仅存 localStorage，供题库配置以 ${openaiApiKey} / ${geminiApiKey} 引用。
+ */
+function createAnswererApiKeyField(kind: 'openai' | 'gemini', label: string, placeholder: string) {
+	const input = h('input', {
+		className: 'modal-input',
+		type: 'password',
+		placeholder,
+		style: { width: '100%', marginTop: '4px' }
+	});
+	input.autocomplete = 'off';
+	input.spellcheck = false;
+	input.value = readAnswererApiKeys()[kind];
+	input.addEventListener('change', () => {
+		saveAnswererApiKey(kind, input.value);
+		$message.success({ content: `${label} 已保存在本机浏览器（不会写入题库配置）` });
+	});
+	return h('div', { style: { marginTop: '8px' } }, [h('div', { className: 'secondary' }, label), input]);
 }
 
 export const CommonEvents = {
@@ -598,6 +618,21 @@ export const CommonProject = Project.create({
 							const manualFooter = h('div', { style: { width: '100%' } }, [
 								h('div', { className: 'separator secondary' }, '题库配置填写/修改区'),
 								textarea,
+								h(
+									'div',
+									{ className: 'separator secondary', style: { marginTop: '12px' } },
+									'图片题 API 密钥（可选，仅保存在本机）'
+								),
+								h('div', { style: { marginTop: '8px', fontSize: '12px' } }, [
+									h(
+										'div',
+										{ className: 'secondary' },
+										// eslint-disable-next-line no-template-curly-in-string
+										'在题库配置中通过 ${openaiApiKey} / ${geminiApiKey} 占位符引用，例如请求头 Authorization: Bearer ${openaiApiKey}。密钥只保存在本机浏览器，不会写入题库配置，也不会随配置导出。'
+									),
+									createAnswererApiKeyField('openai', 'OpenAI API Key', 'sk-...'),
+									createAnswererApiKeyField('gemini', 'Gemini API Key', 'AIza... 或代理服务密钥')
+								]),
 								h('div', { style: { marginTop: '12px', fontSize: '12px' } }, [
 									// 解析器选项独占一行
 									h('div', { style: { marginBottom: '12px' } }, ['解析器：', select]),
@@ -914,7 +949,7 @@ export const CommonProject = Project.create({
 						type: 'checkbox',
 						title:
 							'遇到图片题解析图片成 Base64 上传给题库，防止遇到防盗链等问题无法加载。' +
-							`需题库配置支持（POST 方法且引用了 \${images} / \${suggestion_title} / \${suggestion_options} 字段），` +
+							`需题库配置支持（POST 方法且引用了 \${images} / \${rich_content} 字段），` +
 							'否则需重新配置题库。原题 title / options 不会被修改。'
 					},
 					defaultValue: true
@@ -927,7 +962,7 @@ export const CommonProject = Project.create({
 						type: 'number',
 						min: 10,
 						step: 1,
-						max: 3 * 60,
+						max: 6 * 60,
 						title: '搜题超时时间，单位为秒，超过这个时间直接放弃，进行下一题搜索。'
 					},
 					defaultValue: 120

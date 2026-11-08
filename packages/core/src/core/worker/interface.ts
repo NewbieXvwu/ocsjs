@@ -29,6 +29,95 @@ export type QuestionTypes = 'single' | 'multiple' | 'completion' | 'judgement' |
 
 export type AnswerMatchMode = 'exact' | 'similar';
 
+/** 页面坐标（CSS 像素），来源于真实 DOM 的 getBoundingClientRect */
+export interface QuestionBox {
+	x: number;
+	y: number;
+	width: number;
+	height: number;
+}
+
+/**
+ * 题目文档中的一个有序片段。
+ * 文本与图片必须保持原有先后顺序，图片片段可携带稳定的图片 ID。
+ */
+export type QuestionPart =
+	| { kind: 'text'; text: string; box?: QuestionBox }
+	| {
+			kind: 'image';
+			url: string;
+			box?: QuestionBox;
+			/** 例如 Q-1 / A-1，由 makeQuestionIR 统一分配 */
+			imageId?: string;
+			/** 在所属题干/选项内的序号（从 1 开始） */
+			localIndex?: number;
+			/** 图片来源：img / canvas / svg / css-background */
+			origin?: string;
+	  }
+	| { kind: 'missing-image'; reason?: string; box?: QuestionBox };
+
+/** 题干或某个选项的文本/图片文档 */
+export interface QuestionDocument {
+	parts: QuestionPart[];
+	text: string;
+	images: string[];
+	missingImages: number;
+	box?: QuestionBox | null;
+}
+
+/** 选项 IR：选项代号即答题标识，node 仅用于最终点击，不发送给模型 */
+export interface QuestionChoice {
+	id: string;
+	index: number;
+	node?: HTMLElement;
+	box?: QuestionBox | null;
+	document: QuestionDocument;
+}
+
+/** 归一化到 0-1000 的相对坐标 */
+export interface QuestionRelativeBox {
+	x: number;
+	y: number;
+	w: number;
+	h: number;
+}
+
+export interface QuestionLayoutSection {
+	id: string;
+	box: QuestionBox | null;
+	relative: QuestionRelativeBox | null;
+}
+
+export interface QuestionLayoutImage {
+	id?: string;
+	section: string;
+	box: QuestionBox | null;
+	relative: QuestionRelativeBox | null;
+}
+
+export interface QuestionLayout {
+	scene: QuestionBox | null;
+	/** 只有真实 DOM 坐标足够可靠时才为 true，否则不发送推测坐标 */
+	geometryReady: boolean;
+	complex: boolean;
+	sections: QuestionLayoutSection[];
+	images: QuestionLayoutImage[];
+}
+
+/**
+ * QuestionIR v3：文本与图片的顺序、图片归属与页面位置在提取和请求之间保持不变。
+ */
+export interface QuestionIR {
+	version: 3;
+	type: QuestionTypes;
+	stem: QuestionDocument;
+	choices: QuestionChoice[];
+	imageIds: string[];
+	hasMedia: boolean;
+	missingImages: number;
+	layout?: QuestionLayout;
+}
+
 /** 答题器上下文 */
 export interface WorkContext<E> {
 	root: HTMLElement;
@@ -37,6 +126,8 @@ export interface WorkContext<E> {
 	type: QuestionTypes;
 	/** 答案分隔符 */
 	answerSeparators?: string[];
+	/** 由 createCommonAnswerer 构建的结构化题目；老平台/自定义工作器可能为空 */
+	questionIR?: QuestionIR;
 }
 
 /** 答案题目处理器结果 */

@@ -1,5 +1,11 @@
-import { AnswererWrapper } from '@ocsjs/core';
+/* global GM_xmlhttpRequest */
+import type { AnswererWrapper, QuestionIR } from '@ocsjs/core';
 import { getImageSize, upscalePngDataUrl } from './png-upscaler';
+import { IMAGE_URL_REGEX, canonicalImageUrl, imageUrlMatches } from './image-url';
+import { normalizedQuestionBox, questionImageManifestText, questionImageSpatialRelations } from './question-ir';
+import { getAnswererApiKeyEnv } from './answerer-api-keys';
+
+export { IMAGE_URL_REGEX, canonicalImageUrl, imageUrlMatches };
 
 export interface ImageSuggestionResult {
 	/** base64 图片数组，顺序对应 [图片1]、[图片2]… */
@@ -49,145 +55,377 @@ async function nodeFetchToBase64(url: string): Promise<string> {
 	return `data:${contentType};base64,${buf.toString('base64')}`;
 }
 
-/**
- * URL → base64 会话级缓存（LRU）。
- * 同一份试卷中公式图常在多题间复用，重试/重新答题也会重复请求同一批图片，
- * 命中缓存可跳过网络下载与 Canvas 转换。
- */
-const IMAGE_BASE64_CACHE_MAX = 200;
-const imageBase64Cache = new Map<string, string>();
+/** 单题图片传输限制（多模态题库） */
+const QUESTION_MEDIA = Object.freeze({
+	timeoutMs: 15_000,
+	maxImageBytes: 20 * 1024 * 1024,
+	maxTotalBytes: 40 * 1024 * 1024,
+	maxImages: 32,
+	concurrency: 3
+});
 
-/**
- * 将图片转换为 base64 字符串
- * 支持传入 URL 字符串或 HTMLImageElement
- * 优先使用 Canvas 方式（浏览器已携带认证信息加载图片，可绕过防盗链）
- * Canvas 失败时（跨域无 CORS 头导致画布被污染）回退到 GM_xmlhttpRequest
- */
-export function imageToBase64(source: string | HTMLImageElement): Promise<string> {
-	const url = typeof source === 'string' ? source : source.src;
-	// data URL 本身已是 base64 且键过长，不参与缓存
-	if (url && !url.startsWith('data:')) {
-		const cached = imageBase64Cache.get(url);
-		if (cached) {
-			// LRU：命中后刷新为最新插入位置
-			imageBase64Cache.delete(url);
-			imageBase64Cache.set(url, cached);
-			return Promise.resolve(cached);
-		}
-		return convertImageToBase64(source).then((b64) => {
-			if (imageBase64Cache.size >= IMAGE_BASE64_CACHE_MAX) {
-				// 删除最老条目（Map 按插入顺序迭代）
-				imageBase64Cache.delete(imageBase64Cache.keys().next().value!);
-			}
-			imageBase64Cache.set(url, b64);
-			return b64;
-		});
+/** 仅共享进行中的下载，避免课程复用 URL 时拿到过期像素 */
+const QUESTION_IMAGE_PENDING = new Map<string, Promise<string>>();
+
+/** 通过文件头识别真实图片类型，绝不根据 URL 或响应头猜测 */
+function mimeFromImageBytes(bytes: Uint8Array): string {
+	if (
+		bytes.length >= 24 &&
+		bytes[0] === 137 &&
+		bytes[1] === 80 &&
+		bytes[2] === 78 &&
+		bytes[3] === 71 &&
+		bytes[4] === 13 &&
+		bytes[5] === 10 &&
+		bytes[6] === 26 &&
+		bytes[7] === 10
+	)
+		return 'image/png';
+	if (bytes.length >= 4 && bytes[0] === 255 && bytes[1] === 216 && bytes[2] === 255) return 'image/jpeg';
+	if (
+		bytes.length >= 12 &&
+		String.fromCharCode(...Array.from(bytes.subarray(0, 4))) === 'RIFF' &&
+		String.fromCharCode(...Array.from(bytes.subarray(8, 12))) === 'WEBP'
+	)
+		return 'image/webp';
+	if (
+		bytes.length >= 10 &&
+		(String.fromCharCode(...Array.from(bytes.subarray(0, 6))) === 'GIF87a' ||
+			String.fromCharCode(...Array.from(bytes.subarray(0, 6))) === 'GIF89a')
+	)
+		return 'image/gif';
+	if (bytes.length >= 26 && bytes[0] === 66 && bytes[1] === 77) return 'image/bmp';
+	if (bytes.length >= 5) {
+		const start = new TextDecoder('utf-8')
+			.decode(bytes.subarray(0, Math.min(2048, bytes.length)))
+			.replace(/^\uFEFF/, '')
+			.trimStart();
+		if (/^(?:<\?xml\b[\s\S]*?\?>\s*)?<svg[\s>]/i.test(start)) return 'image/svg+xml';
 	}
-	return convertImageToBase64(source);
+	return '';
 }
 
-/** 实际的图片转 base64 实现（不经过缓存，由 {@link imageToBase64} 调用） */
-function convertImageToBase64(source: string | HTMLImageElement): Promise<string> {
-	return new Promise((resolve, reject) => {
-		// 如果是 HTMLImageElement，直接用 Canvas 绘制转换
-		if (typeof HTMLImageElement !== 'undefined' && source instanceof HTMLImageElement) {
-			// 已经是 data URL，直接返回
-			if (source.src.startsWith('data:')) {
-				resolve(source.src);
-				return;
-			}
-			try {
-				const canvas = document.createElement('canvas');
-				canvas.width = source.naturalWidth;
-				canvas.height = source.naturalHeight;
-				const ctx = canvas.getContext('2d')!;
-				ctx.drawImage(source, 0, 0);
-				const dataUrl = canvas.toDataURL('image/png');
-				resolve(dataUrl);
-				return;
-			} catch {
-				// Canvas 被污染（跨域无 CORS），回退到 GM_xmlhttpRequest
-			}
+const DATA_IMAGE_PREFIX = /^data:([^,]*?),(.*)$/is;
+
+function imageBytesToDataUrl(bytes: Uint8Array, mime: string): string {
+	let bin = '';
+	for (let at = 0; at < bytes.length; at += 32768) {
+		bin += String.fromCharCode(...Array.from(bytes.subarray(at, at + 32768)));
+	}
+	return `data:${mime};base64,${btoa(bin)}`;
+}
+
+function dataUrlToImageBytes(url: string): Uint8Array {
+	const parsed = DATA_IMAGE_PREFIX.exec(url);
+	if (!parsed) throw new Error('图片数据地址格式错误');
+	const [, meta, payload] = parsed;
+	if (payload.length > QUESTION_MEDIA.maxImageBytes * 2.8) throw new Error('图片数据过大');
+	if (/;base64(?:;|$)/i.test(meta)) {
+		const clean = payload.replace(/\s+/g, '');
+		if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(clean)) {
+			throw new Error('图片 Base64 格式损坏');
 		}
+		const decoded = atob(clean);
+		const bytes = new Uint8Array(decoded.length);
+		for (let i = 0; i < decoded.length; i++) bytes[i] = decoded.charCodeAt(i);
+		return bytes;
+	}
+	// SVG data URI 常见 percent-encoding，而非 base64。
+	return new TextEncoder().encode(decodeURIComponent(payload));
+}
 
-		// URL 字符串或 Canvas 回退：尝试通过 crossOrigin="anonymous" 加载图片再用 Canvas 转换
-		const url = typeof source === 'string' ? source : source.src;
-
-		// 已经是 data URL，直接返回
-		if (url.startsWith('data:')) {
-			resolve(url);
-			return;
-		}
-
-		// Node 环境：直接拉取图片字节转 base64
-		if (isNodeEnv()) {
-			nodeFetchToBase64(url).then(resolve, reject);
-			return;
-		}
-
-		// 浏览器环境：尝试设置 crossOrigin 加载图片 + Canvas 转换
+async function rasterizeImage(bytes: Uint8Array, mime: string): Promise<string> {
+	if (typeof document === 'undefined' || typeof Image === 'undefined') {
+		throw new Error('当前环境无法转换 SVG/BMP 图片');
+	}
+	const objectUrl = URL.createObjectURL(new Blob([bytes], { type: mime }));
+	try {
 		const img = new Image();
-		img.crossOrigin = 'anonymous';
-		img.onload = () => {
-			try {
-				const canvas = document.createElement('canvas');
-				canvas.width = img.naturalWidth;
-				canvas.height = img.naturalHeight;
-				const ctx = canvas.getContext('2d')!;
-				ctx.drawImage(img, 0, 0);
-				resolve(canvas.toDataURL('image/png'));
-			} catch {
-				// Canvas 失败，回退到 GM_xmlhttpRequest
-				gmXmlHttpRequestFallback(url, resolve, reject);
-			}
-		};
-		img.onerror = () => {
-			// 图片加载失败（CORS 阻止），回退到 GM_xmlhttpRequest
-			gmXmlHttpRequestFallback(url, resolve, reject);
-		};
-		img.src = url;
-	});
-}
-
-/** GM_xmlhttpRequest 回退方案，忽略跨域限制 */
-function gmXmlHttpRequestFallback(url: string, resolve: (value: string) => void, reject: (reason: any) => void) {
-	if (typeof GM_xmlhttpRequest === 'undefined') {
-		reject(new Error('图片转 base64 失败'));
-		return;
+		await new Promise<void>((resolve, reject) => {
+			const timer = setTimeout(() => reject(new Error('图片解码超时')), QUESTION_MEDIA.timeoutMs);
+			img.onload = () => {
+				clearTimeout(timer);
+				resolve();
+			};
+			img.onerror = () => {
+				clearTimeout(timer);
+				reject(new Error('浏览器无法解码此图片'));
+			};
+			img.src = objectUrl;
+		});
+		const width = img.naturalWidth || img.width;
+		const height = img.naturalHeight || img.height;
+		if (!width || !height || width * height > 40_000_000) throw new Error('图片尺寸无效或过大');
+		const canvas = document.createElement('canvas');
+		canvas.width = width;
+		canvas.height = height;
+		const ctx = canvas.getContext('2d');
+		if (!ctx) throw new Error('Canvas 初始化失败');
+		ctx.drawImage(img, 0, 0);
+		return canvas.toDataURL('image/png');
+	} finally {
+		URL.revokeObjectURL(objectUrl);
 	}
-	// eslint-disable-next-line no-undef
-	GM_xmlhttpRequest({
-		url,
-		method: 'GET',
-		responseType: 'blob',
-		onload: (response) => {
-			const blob = response.response as Blob;
-			const reader = new FileReader();
-			reader.onloadend = () => resolve(reader.result as string);
-			reader.onerror = reject;
-			reader.readAsDataURL(blob);
-		},
-		onerror: reject
+}
+
+async function validateImageDecode(bytes: Uint8Array, mime: string): Promise<void> {
+	// 浏览器解码可捕获“文件头有效但内容截断”的 JPEG/PNG/WebP。
+	if (typeof Image === 'undefined' || typeof document === 'undefined') return;
+	const objectUrl = URL.createObjectURL(new Blob([bytes], { type: mime }));
+	try {
+		const img = new Image();
+		await new Promise<void>((resolve, reject) => {
+			const timer = setTimeout(() => reject(new Error('图片解码校验超时')), QUESTION_MEDIA.timeoutMs);
+			img.onload = () => {
+				clearTimeout(timer);
+				resolve();
+			};
+			img.onerror = () => {
+				clearTimeout(timer);
+				reject(new Error('文件头有效，但图片内容损坏'));
+			};
+			img.src = objectUrl;
+		});
+		if (!img.naturalWidth || !img.naturalHeight) throw new Error('图片尺寸无效');
+	} finally {
+		URL.revokeObjectURL(objectUrl);
+	}
+}
+
+async function normalizeImageBytes(input: Uint8Array | ArrayBuffer): Promise<string> {
+	const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
+	if (bytes.length === 0) throw new Error('图片内容为空');
+	if (bytes.length > QUESTION_MEDIA.maxImageBytes) throw new Error('图片超过 20 MiB，未发送给模型');
+	const mime = mimeFromImageBytes(bytes);
+	if (!mime) throw new Error('返回内容不是受支持的图片（可能是登录页或错误页）');
+	if (mime === 'image/svg+xml' || mime === 'image/bmp') return rasterizeImage(bytes, mime);
+	// GIF 转 PNG，保证模型拿到稳定的首帧。
+	if (mime === 'image/gif' && typeof document !== 'undefined') return rasterizeImage(bytes, mime);
+	await validateImageDecode(bytes, mime);
+	return imageBytesToDataUrl(bytes, mime);
+}
+
+function gmReadImageBytes(url: string): Promise<Uint8Array> {
+	if (typeof GM_xmlhttpRequest !== 'function') {
+		return Promise.reject(new Error('脚本管理器未提供跨域图片下载能力'));
+	}
+	return new Promise((resolve, reject) => {
+		let finished = false;
+		let req: any;
+		const settle = (error: Error | null, value?: Uint8Array) => {
+			if (finished) return;
+			finished = true;
+			clearTimeout(timer);
+			error ? reject(error) : resolve(value!);
+		};
+		const timer = setTimeout(() => {
+			try {
+				req && req.abort && req.abort();
+			} catch {
+				/* ignored */
+			}
+			settle(new Error('图片下载超时'));
+		}, QUESTION_MEDIA.timeoutMs + 250);
+		try {
+			req = GM_xmlhttpRequest({
+				method: 'GET',
+				url,
+				responseType: 'arraybuffer',
+				timeout: QUESTION_MEDIA.timeoutMs,
+				onload: async (response: any) => {
+					try {
+						if (response.status < 200 || response.status >= 300) {
+							throw new Error(`HTTP ${response.status}`);
+						}
+						let raw = response.response;
+						if (typeof Blob !== 'undefined' && raw instanceof Blob) raw = await raw.arrayBuffer();
+						const isArrayBuffer = Object.prototype.toString.call(raw) === '[object ArrayBuffer]';
+						if (!isArrayBuffer && !ArrayBuffer.isView(raw)) {
+							throw new Error('请求没有返回二进制图片数据');
+						}
+						settle(
+							null,
+							ArrayBuffer.isView(raw)
+								? new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength)
+								: new Uint8Array(raw as ArrayBuffer)
+						);
+					} catch (e: any) {
+						settle(e);
+					}
+				},
+				onerror: () => settle(new Error('图片下载网络错误')),
+				ontimeout: () => settle(new Error('图片下载超时')),
+				onabort: () => settle(new Error('图片下载被终止'))
+			});
+		} catch (e: any) {
+			settle(e);
+		}
 	});
 }
 
-/**
- * 将任意 data URL（可能含 charset 等参数、或非 png mime）统一为 data:image/png;base64,{b64} 格式。
- * 仅重写前缀与 mime，不转换图片字节。
- */
-function normalizeToPngDataUrl(dataUrl: string): string {
-	const m = dataUrl.match(/^data:[^;,]+.*?;base64,(.+)$/);
-	return `data:image/png;base64,${m ? m[1] : dataUrl}`;
+async function fetchReadImageBytes(url: string): Promise<Uint8Array> {
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), QUESTION_MEDIA.timeoutMs);
+	try {
+		const response = await fetch(url, { credentials: 'include', signal: controller.signal });
+		if (!response.ok) throw new Error(`HTTP ${response.status}`);
+		const len = Number(response.headers.get('content-length') || 0);
+		if (len > QUESTION_MEDIA.maxImageBytes) throw new Error('图片超过 20 MiB');
+		return new Uint8Array(await response.arrayBuffer());
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
+async function canvasReadImage(url: string): Promise<string> {
+	if (typeof Image === 'undefined') throw new Error('无可用图像解码器');
+	const image = new Image();
+	image.crossOrigin = 'anonymous';
+	await new Promise<void>((resolve, reject) => {
+		const timer = setTimeout(() => reject(new Error('图片解码超时')), QUESTION_MEDIA.timeoutMs);
+		image.onload = () => {
+			clearTimeout(timer);
+			resolve();
+		};
+		image.onerror = () => {
+			clearTimeout(timer);
+			reject(new Error('图片无法载入'));
+		};
+		image.src = url;
+	});
+	const width = image.naturalWidth || image.width;
+	const height = image.naturalHeight || image.height;
+	if (!width || !height || width * height > 40_000_000) throw new Error('图片尺寸无效或过大');
+	const canvas = document.createElement('canvas');
+	canvas.width = width;
+	canvas.height = height;
+	const ctx = canvas.getContext('2d');
+	if (!ctx) throw new Error('Canvas 不可用');
+	ctx.drawImage(image, 0, 0, width, height);
+	const result = canvas.toDataURL('image/png');
+	// 某些运行时即使图片损坏，Canvas 仍会产出 data URL。
+	return normalizeImageBytes(dataUrlToImageBytes(result));
+}
+
+async function downloadImageDataUrl(rawUrl: string): Promise<string> {
+	const url = canonicalImageUrl(rawUrl);
+	if (!url) throw new Error('图片地址无效');
+	if (url.startsWith('data:')) return normalizeImageBytes(dataUrlToImageBytes(url));
+	if (url.startsWith('blob:')) return normalizeImageBytes(await fetchReadImageBytes(url));
+	if (isNodeEnv()) {
+		return normalizeImageBytes(dataUrlToImageBytes(await nodeFetchToBase64(url)));
+	}
+	let firstError: Error | undefined;
+	try {
+		// 同源 fetch 保留课程登录 Cookie；跨域由 GM 分支处理。
+		if (typeof location !== 'undefined' && new URL(url).origin === location.origin) {
+			return await normalizeImageBytes(await fetchReadImageBytes(url));
+		}
+	} catch (e: any) {
+		firstError = e;
+	}
+	try {
+		return await normalizeImageBytes(await gmReadImageBytes(url));
+	} catch (e: any) {
+		firstError = firstError || e;
+	}
+	try {
+		return await canvasReadImage(url);
+	} catch (e: any) {
+		throw new Error(`${firstError ? firstError.message + '；' : ''}${e.message}`);
+	}
 }
 
 /** 图片最小边长阈值：低于此值的图片会被题库/模型（如豆包 14px）拒绝，需放大后再提交 */
 const MIN_IMAGE_DIMENSION = 14;
 
+const IMAGE_BASE64_CACHE_MAX = 200;
+const imageBase64Cache = new Map<string, string>();
+
+/** 读取任意格式图片的尺寸（浏览器解码） */
+async function decodedImageSize(dataUrl: string): Promise<{ width: number; height: number } | undefined> {
+	if (typeof Image === 'undefined' || typeof document === 'undefined') return undefined;
+	return new Promise((resolve) => {
+		const img = new Image();
+		const timer = setTimeout(() => resolve(undefined), QUESTION_MEDIA.timeoutMs);
+		img.onload = () => {
+			clearTimeout(timer);
+			resolve({ width: img.naturalWidth || img.width, height: img.naturalHeight || img.height });
+		};
+		img.onerror = () => {
+			clearTimeout(timer);
+			resolve(undefined);
+		};
+		img.src = dataUrl;
+	});
+}
+
+/** 小图放大：仅 PNG 可直接放大，其他格式先转为 PNG */
+async function prepareImageForAnswerer(dataUrl: string): Promise<string> {
+	try {
+		const pngSize = getImageSize(dataUrl);
+		if (pngSize) {
+			if (pngSize.width < MIN_IMAGE_DIMENSION || pngSize.height < MIN_IMAGE_DIMENSION) {
+				return await upscalePngDataUrl(dataUrl, MIN_IMAGE_DIMENSION);
+			}
+			return dataUrl;
+		}
+		const size = await decodedImageSize(dataUrl);
+		if (size && (size.width < MIN_IMAGE_DIMENSION || size.height < MIN_IMAGE_DIMENSION)) {
+			if (typeof document === 'undefined') return dataUrl;
+			const img = new Image();
+			await new Promise<void>((resolve, reject) => {
+				img.onload = () => resolve();
+				img.onerror = () => reject(new Error('图片无法解码'));
+				img.src = dataUrl;
+			});
+			const canvas = document.createElement('canvas');
+			canvas.width = img.naturalWidth || img.width;
+			canvas.height = img.naturalHeight || img.height;
+			const ctx = canvas.getContext('2d');
+			if (!ctx) return dataUrl;
+			ctx.drawImage(img, 0, 0);
+			return await upscalePngDataUrl(canvas.toDataURL('image/png'), MIN_IMAGE_DIMENSION);
+		}
+	} catch {
+		/* 放大失败时按原图提交 */
+	}
+	return dataUrl;
+}
+
 /**
- * 匹配图片 URL：非贪婪且排除中文/全角字符，避免跨越多个 URL 或中文文本拼成非法 URL
- * 供 createImageSuggestion 及外部（消息气泡文本压缩等）复用
+ * 将图片转换为 base64 data URL。
+ * 会话级 LRU 缓存避免同一试卷/重试时重复下载；同 URL 的并发请求共享一次下载。
  */
-export const IMAGE_URL_REGEX = /https?:\/\/[^\s一-鿿＀-￯]+?\.(?:png|jpe?g|gif|bmp|webp|svg)(?:\?[^\s一-鿿＀-￯]*)?/gi;
+export async function imageToBase64(source: string | HTMLImageElement): Promise<string> {
+	const raw = typeof source === 'string' ? source : source && (source.currentSrc || source.src);
+	const url = canonicalImageUrl(raw);
+	if (!url) throw new Error('缺少有效图片地址');
+	if (url.startsWith('data:')) return prepareImageForAnswerer(await normalizeImageBytes(dataUrlToImageBytes(url)));
+
+	const cached = imageBase64Cache.get(url);
+	if (cached) {
+		imageBase64Cache.delete(url);
+		imageBase64Cache.set(url, cached);
+		return cached;
+	}
+	const pending = QUESTION_IMAGE_PENDING.get(url);
+	if (pending) return pending;
+	const task = downloadImageDataUrl(url)
+		.then(prepareImageForAnswerer)
+		.then((dataUrl) => {
+			if (imageBase64Cache.size >= IMAGE_BASE64_CACHE_MAX) {
+				imageBase64Cache.delete(imageBase64Cache.keys().next().value!);
+			}
+			imageBase64Cache.set(url, dataUrl);
+			return dataUrl;
+		})
+		.finally(() => {
+			if (QUESTION_IMAGE_PENDING.get(url) === task) QUESTION_IMAGE_PENDING.delete(url);
+		});
+	QUESTION_IMAGE_PENDING.set(url, task);
+	return task;
+}
 
 export async function createImageSuggestion(
 	title: string,
@@ -197,30 +435,26 @@ export async function createImageSuggestion(
 	/** DOM 调用方可直接传入按文档顺序的选项图片 URL，跳过正则提取 */
 	optionImages?: string[]
 ): Promise<ImageSuggestionResult | undefined> {
-	// 收集标题和选项中的所有图片 URL，保持顺序
-	// 若调用方提供 images 数组则直接使用（DOM 遍历所得，跳过正则）；否则回退到正则提取（字符串输入场景）
-	const titleUrls = titleImages && titleImages.length ? titleImages.slice() : title.match(IMAGE_URL_REGEX) || [];
-	const optionUrls = optionImages && optionImages.length ? optionImages.slice() : options?.match(IMAGE_URL_REGEX) || [];
+	const titleUrls = titleImages && titleImages.length ? titleImages.slice() : imageUrlMatches(title);
+	const optionUrls = optionImages && optionImages.length ? optionImages.slice() : imageUrlMatches(options || '');
 
 	if (titleUrls.length === 0 && optionUrls.length === 0) return undefined;
 
-	// 去重，保持顺序
 	const allUrls: string[] = [];
 	const seen = new Set<string>();
 	for (const url of [...titleUrls, ...optionUrls]) {
-		if (!seen.has(url)) {
-			seen.add(url);
-			allUrls.push(url);
+		const normalized = canonicalImageUrl(url);
+		if (normalized && !seen.has(normalized)) {
+			seen.add(normalized);
+			allUrls.push(normalized);
 		}
 	}
 
-	// 并行转换所有图片为 base64
 	const base64Map = new Map<string, string>();
 	await Promise.all(
 		allUrls.map(async (url) => {
 			try {
-				const base64 = await imageToBase64(url);
-				base64Map.set(url, base64);
+				base64Map.set(url, await imageToBase64(url));
 			} catch {
 				// 转换失败的图片跳过
 			}
@@ -229,44 +463,32 @@ export async function createImageSuggestion(
 
 	if (base64Map.size === 0) return undefined;
 
-	// 构建 URL → [图片N] 的映射，同时按顺序收集 base64 数组
-	// 按 allUrls（题目/选项中的出现顺序）遍历，而非下载完成顺序，保证编号与原文一致
-	// 占位符左右各加两个空格，与相邻中文/符号分隔，便于题库解析
 	const images: string[] = [];
 	const urls: string[] = [];
 	const placeholderMap = new Map<string, string>();
 	for (const url of allUrls) {
 		const base64 = base64Map.get(url);
 		if (!base64) continue;
-		// 统一为 data:image/png;base64,{b64} 格式，去除 charset 等参数与原始 mime 差异
-		let normalized = normalizeToPngDataUrl(base64);
-		// 过小图片放大到 ≥ MIN_IMAGE_DIMENSION，避免模型（如豆包 14px）拒绝
-		const size = getImageSize(normalized);
-		if (size && (size.width < MIN_IMAGE_DIMENSION || size.height < MIN_IMAGE_DIMENSION)) {
-			try {
-				normalized = await upscalePngDataUrl(normalized, MIN_IMAGE_DIMENSION);
-			} catch (e: any) {
-				console.warn(`[imageOptimize] 图片 ${size.width}x${size.height} 放大失败，已跳过：${url}（${e?.message}）`);
-				continue;
-			}
+		try {
+			// imageToBase64 已完成格式校验与 14px 放大，这里直接使用，避免重复解码。
+			images.push(base64);
+			urls.push(url);
+			placeholderMap.set(url, ` [图片${images.length}] `);
+		} catch (e: any) {
+			console.warn(`[imageOptimize] 图片处理失败，已跳过：${url}（${e?.message}）`);
 		}
-		placeholderMap.set(url, ` [图片${images.length + 1}] `);
-		images.push(normalized);
-		urls.push(url);
 	}
 
 	if (images.length === 0) return undefined;
 
-	// 标题：URL 替换为 [图片N] 占位符（不含 base64）
 	let suggestionTitle = title;
 	for (const [url, placeholder] of placeholderMap) {
 		suggestionTitle = suggestionTitle.split(url).join(placeholder);
 	}
 
-	// 选项：URL 替换为 [图片N] 占位符（不含 base64），仅当选项含图片时返回
 	let suggestionOptions: string | undefined;
 	if (options) {
-		const hasOptionImages = optionUrls.some((url) => base64Map.has(url));
+		const hasOptionImages = optionUrls.some((url) => base64Map.has(canonicalImageUrl(url)));
 		if (hasOptionImages) {
 			suggestionOptions = options;
 			for (const [url, placeholder] of placeholderMap) {
@@ -296,7 +518,7 @@ function dedupeLines(str: string): string {
 	return result.join('\n');
 }
 
-export async function buildAnswererEnv(params: {
+interface LegacyAnswererEnvParams {
 	type?: string;
 	title: string;
 	/** 选项文本，支持字符串或字符串数组（数组会按行拼接为字符串） */
@@ -306,30 +528,53 @@ export async function buildAnswererEnv(params: {
 	/** DOM 调用方传入的选项图片 URL（跳过正则提取） */
 	optionsImages?: string[];
 	enableImageOptimize?: boolean;
-}): Promise<{
+}
+
+interface QuestionAnswererEnvParams {
+	question: QuestionIR;
+	enableImageOptimize?: boolean;
+}
+
+/**
+ * 构建题库请求环境。
+ *
+ * - 传入 `question`：使用 QuestionIR v3 的有序文本/图片、图片 ID 与布局信息，
+ *   图片按原始顺序写入 `images` 与 `rich_content`（OpenAI Responses / Gemini 原生格式）。
+ * - 传入旧参数：保留 5.3.1 的 [图片N] 占位符行为，供在线搜题测试等旧调用方使用。
+ */
+export async function buildAnswererEnv(params: LegacyAnswererEnvParams): Promise<{
 	env: Record<string, any>;
-	/** 与 env.images 严格同序的图片原始 URL（无图片时为空数组），供 [图片N] 还原直接使用 */
+	imageUrls: string[];
+}>;
+export async function buildAnswererEnv(params: QuestionAnswererEnvParams): Promise<{
+	env: Record<string, any>;
+	imageUrls: string[];
+}>;
+export async function buildAnswererEnv(params: LegacyAnswererEnvParams | QuestionAnswererEnvParams): Promise<{
+	env: Record<string, any>;
 	imageUrls: string[];
 }> {
-	// options 归一化为字符串：数组按行拼接，保证后续占位符替换与图片匹配均为字符串处理
+	if ('question' in params && params.question) {
+		return buildAnswererEnvFromQuestion(params.question, params.enableImageOptimize);
+	}
+	return buildLegacyAnswererEnv(params as LegacyAnswererEnvParams);
+}
+
+async function buildLegacyAnswererEnv(params: LegacyAnswererEnvParams) {
 	const rawOptions = Array.isArray(params.options)
 		? params.options.filter((o) => o != null && o !== '').join('\n')
 		: params.options ?? '';
-	// options 按行去重（保持顺序）
 	const options = dedupeLines(rawOptions);
-	// 原题 title / options 始终保留，不做覆盖与修改
 	const env: Record<string, any> = {
 		type: params.type || 'unknown',
 		title: params.title,
-		options
+		options,
+		...getAnswererApiKeyEnv()
 	};
 	let imageUrls: string[] = [];
 	if (params.enableImageOptimize) {
 		const suggestion = await createImageSuggestion(params.title, options, params.titleImages, params.optionsImages);
 		if (suggestion) {
-			// 新增独立字段，由题库配置（v2）显式引用后才会被提交
-			// 注意：env.images 不做内容去重——[图片N] 占位符编号与 images 顺序严格对应，
-			// 按 base64 内容去重会破坏对齐（服务端 dedupQuestionData 已有带重映射的去重）。
 			env.images = suggestion.images;
 			imageUrls = suggestion.urls;
 			env.suggestion_title = suggestion.suggestion_title;
@@ -341,29 +586,225 @@ export async function buildAnswererEnv(params: {
 	return { env, imageUrls };
 }
 
-/** 图片题参数占位符：在题库配置 data 字段中引用即声明了图片题参数（模板字符串转义写法，值为 ${...} 字面量） */
-const IMAGE_OPTIMIZE_PLACEHOLDERS = [`\${images}`, `\${suggestion_title}`, `\${suggestion_options}`] as const;
+/** 判断题目是否含图片（含缺失图片），供调用方给出明确错误 */
+function questionHasMedia(question: QuestionIR) {
+	return !!(
+		question.hasMedia ||
+		question.missingImages ||
+		question.stem.parts.some((p) => p.kind !== 'text') ||
+		question.choices.some((c) => c.document.parts.some((p) => p.kind !== 'text'))
+	);
+}
 
-/** 字段解析器源码中的图片题 env 引用（含解构写法 const { images } = env，排除 titleImages/imagesList 等子串误配） */
-const IMAGE_ENV_REF_PATTERN = /(^|[^\w$])(images|suggestion_title|suggestion_options)(?![\w$])/;
+async function buildAnswererEnvFromQuestion(question: QuestionIR, enableImageOptimize?: boolean) {
+	if (!question || question.version !== 3) throw new Error('题目结构尚未建立');
+	if (question.missingImages) {
+		throw new Error(`题目有 ${question.missingImages} 个图片节点无法读取，已停止本题以防误答`);
+	}
+	if (questionHasMedia(question) && !enableImageOptimize) {
+		throw new Error('这道题含有图片，请开启「图片题优化」，不能降级成纯文本作答');
+	}
 
-/**
- * 题库配置是否支持图片题优化（单个配置）。
- *
- * 判定规则（需同时满足）：
- * 1. 请求方法为 POST——图片数据（base64 数组）必须随请求体提交，GET 仅拼接 URL 参数无法承载；
- * 2. 配置中实际引用了图片题参数（仅 POST 而无引用时，图片数据根本不会被上传）：
- *    - data 字符串字段包含 ${images} / ${suggestion_title} / ${suggestion_options} 占位符；
- *    - 或 data 字段解析器（handler）源码中引用了 env.images / env.suggestion_title / env.suggestion_options
- *      （字段解析器接收完整 env，可自由读取图片数据）。
- *
- * 说明：POST 请求仅 data 字段值与 data 字段解析器参与占位符解析，
- * url / headers 不做替换（见 core answer.wrapper.handler.ts），因此只检测这两处。
- *
- * 注意：本函数仅用于**提示**用户更新题库配置，不做任何限制。
- * 因为上传内容由题库配置的占位符决定，而原题 title / options 不再被覆盖，
- * 旧配置（只读 ${title} / ${options}）不会上传新增字段，因此即便返回 false 也是安全的。
- */
+	const occurrences: {
+		id: string;
+		localIndex?: number;
+		url: string;
+		section: string;
+		box: any;
+	}[] = [];
+	const sections = [
+		{ label: 'stem', document: question.stem },
+		...question.choices.map((c) => ({ label: `option:${c.id}`, document: c.document }))
+	];
+	for (const section of sections) {
+		for (const part of section.document.parts) {
+			if (part.kind === 'image') {
+				occurrences.push({
+					id: part.imageId!,
+					localIndex: part.localIndex,
+					url: part.url,
+					section: section.label,
+					box: part.box || null
+				});
+			}
+		}
+	}
+	if (
+		occurrences.some((item) => typeof item.id !== 'string' || !/^(?:Q|[A-Z]{1,3})-\d+$/.test(item.id)) ||
+		new Set(occurrences.map((item) => item.id)).size !== occurrences.length
+	) {
+		throw new Error('图片标识不唯一，无法安全进行多图答题');
+	}
+	if (occurrences.length > QUESTION_MEDIA.maxImages) {
+		throw new Error(`单题含 ${occurrences.length} 处图片，超过可安全发送的 ${QUESTION_MEDIA.maxImages} 处`);
+	}
+
+	const urlToData = new Map<string, string>();
+	const urls = [...new Set(occurrences.map((o) => o.url))];
+	const failures: { url: string; error: Error }[] = [];
+	let cursor = 0;
+	await Promise.all(
+		Array.from({ length: Math.min(QUESTION_MEDIA.concurrency, urls.length) }, async () => {
+			for (;;) {
+				const index = cursor++;
+				if (index >= urls.length) return;
+				try {
+					urlToData.set(urls[index], await imageToBase64(urls[index]));
+				} catch (error: any) {
+					failures.push({ url: urls[index], error });
+				}
+			}
+		})
+	);
+	if (failures.length) {
+		const descriptions = failures.slice(0, 4).map((f) => {
+			const where = [
+				...new Set(
+					occurrences
+						.filter((o) => o.url === f.url)
+						.map((o) => o.section.replace('option:', '选项 ').replace('stem', '题干'))
+				)
+			].join('、');
+			return `${where}: ${f.error.message}`;
+		});
+		throw new Error(`图片读取失败（${failures.length}/${urls.length} 个资源），${descriptions.join('；')}`);
+	}
+
+	const idToData = new Map(occurrences.map((part) => [part.id, urlToData.get(part.url)!]));
+	const layout: NonNullable<QuestionIR['layout']> =
+		question.layout ||
+		({
+			scene: null,
+			geometryReady: false,
+			complex: false,
+			sections: [],
+			images: []
+		} as NonNullable<QuestionIR['layout']>);
+	const rich: ({ type: 'input_text'; text: string } | { type: 'input_image'; image_url: string })[] = [];
+	const images: string[] = [];
+	const imageUrls: string[] = [];
+	const manifest: any[] = [];
+	let textBuffer = '';
+	let nextOccurrence = 0;
+	const flush = () => {
+		if (textBuffer) {
+			rich.push({ type: 'input_text', text: textBuffer });
+			textBuffer = '';
+		}
+	};
+	const beginText = (text: string) => {
+		textBuffer += text;
+	};
+	const detailManifest = occurrences.map((part, i) => ({
+		kind: 'detail' as const,
+		id: part.id,
+		index: i,
+		section: part.section,
+		localIndex: part.localIndex,
+		choiceId: part.section.startsWith('option:') ? part.section.slice(7) : null,
+		relative:
+			layout && layout.geometryReady && part.box && layout.scene ? normalizedQuestionBox(part.box, layout.scene) : null
+	}));
+	if (occurrences.length && layout) {
+		beginText(questionImageManifestText(detailManifest, layout));
+	}
+	const renderSection = (heading: string, doc: QuestionIR['stem'], sectionId: string) => {
+		beginText(heading);
+		let summary = '';
+		for (const part of doc.parts) {
+			if (part.kind === 'text') {
+				beginText(part.text);
+				summary += part.text;
+			} else if (part.kind === 'image') {
+				const index = nextOccurrence++;
+				const item = occurrences[index];
+				if (!item || item.id !== part.imageId || item.section !== sectionId) {
+					throw new Error('图片顺序与选项身份不一致，已取消请求');
+				}
+				const label = `[图片${index + 1}](${part.imageId})`;
+				beginText(`\n[图 ${part.imageId} 开始]\n`);
+				summary += label;
+				const dataUrl = idToData.get(part.imageId!);
+				if (!dataUrl) throw new Error('图片准备状态不一致，已取消请求');
+				flush();
+				rich.push({ type: 'input_image', image_url: dataUrl });
+				beginText(`\n[图 ${part.imageId} 结束]\n`);
+				images.push(dataUrl);
+				imageUrls.push(part.url);
+				manifest.push(detailManifest[index]);
+			} else if (part.kind === 'missing-image') {
+				throw new Error('题目仍包含未读取的图片');
+			}
+		}
+		return summary;
+	};
+	renderSection('题干：\n', question.stem, 'stem');
+	if (question.choices.length) {
+		beginText('\n选项（以下代号是唯一的答题标识）：\n');
+		for (const choice of question.choices) {
+			renderSection(`\n[选项 ${choice.id} 开始]\n`, choice.document, `option:${choice.id}`);
+			beginText(`\n[选项 ${choice.id} 结束]\n`);
+		}
+	}
+	flush();
+	// 旧题库仍读取 title / options：这里保持与 5.3.1 一致的纯文本格式（图片以 URL 内联），
+	// 增强后的顺序、图片 ID 与布局只放在 rich_content / image_* 新字段中，避免破坏旧题库检索。
+	const titleText = question.stem.text;
+	const optionLines = question.choices.map((choice) => `${choice.id}. ${choice.document.text.trim()}`);
+	// 兼容 5.3.1 的 [图片N] 约定：suggestion_* 与 images 严格同序，
+	// 旧题库即使只引用 ${suggestion_title} / ${suggestion_options} 也能继续工作。
+	const placeholderIndex = new Map(detailManifest.map((item, index) => [item.id, index + 1]));
+	const suggestionText = (doc: QuestionIR['stem']) =>
+		doc.parts
+			.map((part) => {
+				if (part.kind === 'text') return part.text;
+				if (part.kind === 'image') return ` [图片${placeholderIndex.get(part.imageId!) ?? ''}] `;
+				return ' [图片尚未加载] ';
+			})
+			.join('');
+	const suggestionTitle = suggestionText(question.stem);
+	const suggestionOptions = question.choices
+		.map((choice) => `${choice.id}. ${suggestionText(choice.document).trim()}`)
+		.join('\n');
+	if (
+		nextOccurrence !== occurrences.length ||
+		images.length !== occurrences.length ||
+		manifest.length !== images.length
+	) {
+		throw new Error('图片序列无法和题目选项一一对应');
+	}
+
+	const totalPayloadSize = images.reduce((size, data) => size + data.length * 0.75, 0);
+	if (totalPayloadSize > QUESTION_MEDIA.maxTotalBytes) {
+		throw new Error('题目图片传输总量超过 40 MiB，未发送不完整请求');
+	}
+
+	const env: Record<string, any> = {
+		type: question.type,
+		title: titleText,
+		...getAnswererApiKeyEnv(),
+		options: optionLines.join('\n'),
+		suggestion_title: suggestionTitle,
+		suggestion_options: suggestionOptions,
+		images,
+		rich_content: rich,
+		choice_ids: question.choices.map((c) => c.id),
+		image_ids: occurrences.map((p) => p.id),
+		image_manifest: manifest,
+		image_layout: {
+			scene_valid: !!layout.geometryReady,
+			relations: layout.geometryReady ? questionImageSpatialRelations(layout) : [],
+			map: detailManifest.map(({ id, section, choiceId, relative }) => ({ id, section, choiceId, relative }))
+		}
+	};
+	return { env, imageUrls };
+}
+
+/** 在解析器内引用这些字段才视为支持图片题（${images} 或 env.rich_content 等） */
+const IMAGE_OPTIMIZE_PLACEHOLDERS = [`\${images}`] as const;
+
+const IMAGE_ENV_REF_PATTERN = /(^|[^\w$])(images|rich_content)(?![\w$])/;
+
 export function isAnswererWrapperSupportImageOptimize(wrapper: AnswererWrapper): boolean {
 	if (!wrapper || String(wrapper.method || 'get').toLowerCase() !== 'post') {
 		return false;
@@ -382,24 +823,10 @@ export function isAnswererWrapperSupportImageOptimize(wrapper: AnswererWrapper):
 	return false;
 }
 
-/**
- * 题库配置列表中是否存在支持图片题优化的配置（任一满足即视为支持）。
- * 判定细节见 isAnswererWrapperSupportImageOptimize。
- */
 export function isAnswererWrappersSupportImageOptimize(wrappers: AnswererWrapper[]): boolean {
 	return wrappers.some(isAnswererWrapperSupportImageOptimize);
 }
 
-/**
- * 生成题库配置签名（FNV-1a 32bit 哈希），用于图片题优化警告的"已关闭记录"比对。
- *
- * 覆盖配置的全部字段（name/url/method/type/data/headers/handler 等）：
- * 仅按 name 拼接的旧算法无法感知配置内容变化（用户更新配置后签名不变、警告不再触发），
- * 全字段哈希使得任何实质配置变化都产生新签名，从而重新触发一次警告。
- *
- * 使用哈希而非 JSON 原文：签名仅用于相等比较，
- * 哈希紧凑且避免在记录中保存完整题库内容（接口地址、解析器代码等）。
- */
 export function createAnswererWrappersSignature(wrappers: AnswererWrapper[]): string {
 	const content = JSON.stringify(wrappers);
 	let hash = 0x811c9dc5;

@@ -167,6 +167,9 @@ importers:
         specifier: ^1.0.0
         version: 1.0.0
     devDependencies:
+      '@types/lodash':
+        specifier: ^4.14.194
+        version: 4.17.24
       '@types/marked':
         specifier: ^4.0.8
         version: 4.3.2

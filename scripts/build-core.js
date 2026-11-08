@@ -96,7 +96,10 @@ function createOptions(ocs) {
 				'localhost',
 				'127.0.0.1',
 				// 智慧树阿里云资源，应用： 图片题资源访问
-				'aliyuncs.com'
+				'aliyuncs.com',
+				// 多模态题库（图片题）常用端点，应用： GM_xmlhttpRequest 跨域请求
+				'api.openai.com',
+				'generativelanguage.googleapis.com'
 			],
 			match: matchMetadata,
 			grant: [

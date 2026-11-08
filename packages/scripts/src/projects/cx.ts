@@ -896,7 +896,7 @@ function workOrExam(
 								'.line_wid_half.fl,.line_wid_half.fr'
 						  ].join(','),
 					root
-				).filter((e) => !!e.textContent?.trim()),
+				).filter((e) => !!e.textContent?.trim() || !!e.querySelector('img,canvas,svg,mjx-container')),
 			options: '.answerBg .answer_p, .textDIV, .eidtDiv',
 			type: type === 'exam' ? 'input[name^="type"]' : 'input[id^="answertype"]',
 			lineAnswerInput: '.line_answer input[name^=answer]',
@@ -1091,7 +1091,7 @@ function mobilelearn(opts: CommonWorkOptions) {
 	const redundanceWords = opts.redundanceWordsText.split('\n').filter(Boolean);
 	const titleTransform = (titles: (HTMLElement | undefined)[]) =>
 		titles
-			.filter((t) => t?.innerText)
+			.filter((t) => t?.innerText || t?.querySelector('img,canvas,svg,mjx-container'))
 			.map((t) =>
 				t
 					? removeRedundantWords(StringUtils.of(titleText(t)).nowrap(' ').nospace().toString().trim(), redundanceWords)

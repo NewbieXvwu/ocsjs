@@ -647,7 +647,7 @@ function workOrExam(type: 'work' | 'exam', { answererWrappers, period, thread, a
 
 	const titleTransform = (titles: (HTMLElement | undefined)[]) => {
 		return titles
-			.filter((t) => t?.innerText)
+			.filter((t) => t?.innerText || t?.querySelector('img,canvas,svg,mjx-container'))
 			.map((t) => t?.innerText)
 			.join(',');
 	};
