@@ -1,9 +1,11 @@
 /* global GM_xmlhttpRequest */
+import { getOpenCodeSessionId } from '@ocsjs/core';
 import type { AnswererWrapper, QuestionIR } from '@ocsjs/core';
 import { getImageSize, upscalePngDataUrl } from './png-upscaler';
 import { IMAGE_URL_REGEX, canonicalImageUrl, imageUrlMatches } from './image-url';
 import { normalizedQuestionBox, questionImageManifestText, questionImageSpatialRelations } from './question-ir';
 import { getAnswererApiKeyEnv } from './answerer-api-keys';
+import { getAnswererSearchOptions } from './answerer-search';
 
 export { IMAGE_URL_REGEX, canonicalImageUrl, imageUrlMatches };
 
@@ -569,7 +571,9 @@ async function buildLegacyAnswererEnv(params: LegacyAnswererEnvParams) {
 		type: params.type || 'unknown',
 		title: params.title,
 		options,
-		...getAnswererApiKeyEnv()
+		...getAnswererApiKeyEnv(),
+		opencodeGoSession: getOpenCodeSessionId(),
+		search: getAnswererSearchOptions()
 	};
 	let imageUrls: string[] = [];
 	if (params.enableImageOptimize) {
@@ -783,6 +787,8 @@ async function buildAnswererEnvFromQuestion(question: QuestionIR, enableImageOpt
 		type: question.type,
 		title: titleText,
 		...getAnswererApiKeyEnv(),
+		opencodeGoSession: getOpenCodeSessionId(),
+		search: getAnswererSearchOptions(),
 		options: optionLines.join('\n'),
 		suggestion_title: suggestionTitle,
 		suggestion_options: suggestionOptions,

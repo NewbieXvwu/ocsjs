@@ -99,7 +99,12 @@ function createOptions(ocs) {
 				'aliyuncs.com',
 				// 多模态题库（图片题）常用端点，应用： GM_xmlhttpRequest 跨域请求
 				'api.openai.com',
-				'generativelanguage.googleapis.com'
+				'generativelanguage.googleapis.com',
+				// OpenCode Go / 搜索增强端点
+				'opencode.ai',
+				'api.deepseek.com',
+				'api.exa.ai',
+				'api.tavily.com'
 			],
 			match: matchMetadata,
 			grant: [

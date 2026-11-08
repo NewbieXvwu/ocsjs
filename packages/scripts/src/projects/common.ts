@@ -4,10 +4,12 @@ import {
 	AnswerWrapperParser,
 	SimplifyWorkResult,
 	WorkUploadType,
-	AnswerWrapperHandlerConfig
+	AnswerWrapperHandlerConfig,
+	type AnswererWrapper,
+	type AnswererSearchMode,
+	type AnswererSearchProvider
 } from '@ocsjs/core';
 import { $message, h, $gm, $store, Project, Script, $modal, $ui, MessageElement, cors } from 'easy-us';
-import type { AnswererWrapper } from '@ocsjs/core';
 import { CXProject, ICourseProject, IcveMoocProject, YKTProject, ZHSProject, ZJYProject } from '../index';
 import { BackgroundProject } from './background';
 import { enableCopy } from '../utils';
@@ -21,7 +23,9 @@ import {
 import { imageUrlMatches } from '../utils/answerer-env';
 import { getAnswererConfigProvider, openAnswererConnect, waitForAnswererConfig } from '../utils/answerer-connect';
 import { confirmRiskyAnswerWrappers } from '../utils/answer-wrapper-security';
+import type { AnswererApiKeyKind } from '../utils/answerer-api-keys';
 import { readAnswererApiKeys, saveAnswererApiKey } from '../utils/answerer-api-keys';
+import { readAnswererSearchConfig, saveAnswererSearchConfig } from '../utils/answerer-search';
 import { initEdgeMinimize } from '../utils/edge-minimize';
 import {
 	createAnswererWrapperSection,
@@ -57,9 +61,9 @@ function formatQuestionForMessage(question: string): string {
 
 /**
  * 题库配置弹窗中的 API 密钥输入框。
- * 密钥仅存 localStorage，供题库配置以 ${openaiApiKey} / ${geminiApiKey} 引用。
+ * 密钥仅存 localStorage，供题库配置以 ${openaiApiKey} 等占位符引用。
  */
-function createAnswererApiKeyField(kind: 'openai' | 'gemini', label: string, placeholder: string) {
+function createAnswererApiKeyField(kind: AnswererApiKeyKind, label: string, placeholder: string) {
 	const input = h('input', {
 		className: 'modal-input',
 		type: 'password',
@@ -74,6 +78,104 @@ function createAnswererApiKeyField(kind: 'openai' | 'gemini', label: string, pla
 		$message.success({ content: `${label} 已保存在本机浏览器（不会写入题库配置）` });
 	});
 	return h('div', { style: { marginTop: '8px' } }, [h('div', { className: 'secondary' }, label), input]);
+}
+
+/** OpenCode Go 支持的常用模型 ID（仅作为输入建议，用户可以自行修改） */
+const OPENCODE_GO_MODELS = [
+	'gpt-6-luna',
+	'gpt-5.6-luna',
+	'glm-5.3',
+	'kimi-k3',
+	'deepseek-v4.1-flash',
+	'deepseek-v4-pro',
+	'minimax-m3',
+	'qwen3.8-max',
+	'gemini-4-argon'
+];
+
+/* eslint-disable max-len */
+/** OpenCode Go 预设使用的 OpenAI Responses 输入构造器 */
+const OPENCODE_GO_INPUT_HANDLER = `return (env) => {
+	const typeMap = { single: '单选题', multiple: '多选题', judgement: '判断题', completion: '填空题' };
+	const type = typeMap[env.type] || '题目';
+	const hasRich = Array.isArray(env.rich_content) && env.rich_content.length > 0;
+	const instruction = '请阅读题干和每个选项（包括只有图片的选项）。选择题只返回正确选项代号，不要返回图片描述；图片题必须在 used_image_ids 中列出实际参考的图片 ID，任何必要图片看不清或归属不明时 ambiguous=true。按 JSON Schema 输出 answers / used_image_ids / ambiguous。';
+	if (hasRich) {
+		return [{ role: 'user', content: [{ type: 'input_text', text: instruction + '\\n题型：' + type }, ...env.rich_content] }];
+	}
+	const text = instruction + '\\n题型：' + type + '\\n问题：' + (env.suggestion_title || env.title) + (env.options ? '\\n选项：\\n' + env.options : '');
+	return [{ role: 'user', content: [{ type: 'input_text', text }] }];
+}`;
+
+/** OpenCode Go 预设使用的 Responses 输出解析器 */
+const OPENCODE_GO_RESPONSE_HANDLER = `return (res) => {
+	if (res && res.error) throw new Error(res.error.message || JSON.stringify(res.error));
+	const outputs = Array.isArray(res && res.output) ? res.output : [];
+	const blocks = outputs.filter(o => o && o.type === 'message').flatMap(m => Array.isArray(m.content) ? m.content : []);
+	const text = (typeof res.output_text === 'string' && res.output_text) ? res.output_text : blocks.filter(c => c && c.type === 'output_text').map(c => c.text).join('\\n');
+	if (!text) throw new Error('OpenCode Go 未返回有效内容');
+	const data = JSON.parse(text);
+	const answers = (data.answers || []).map(a => String(a).trim()).filter(Boolean);
+	if (!answers.length) throw new Error('模型未返回答案');
+	return ['', answers.length === 1 ? answers[0] : JSON.stringify(answers)];
+}`;
+/* eslint-enable max-len */
+
+/**
+ * 生成 OpenCode Go 题库预设。
+ * 请求头适配（x-opencode-session、User-Agent、GM 跨域）由 defaultAnswerWrapperHandler 自动完成；
+ * 这里显式写出会话占位符，方便用户理解请求头结构。
+ */
+function createOpenCodeGoPreset(model: string): AnswererWrapper {
+	return {
+		name: 'OpenCode Go 多模态',
+		homepage: 'https://opencode.ai/docs/go/',
+		url: 'https://opencode.ai/inference/go/openai/v1/responses',
+		method: 'post',
+		type: 'GM_xmlhttpRequest',
+		contentType: 'json',
+		responseType: 'json',
+		headers: {
+			// eslint-disable-next-line no-template-curly-in-string
+			Authorization: 'Bearer ${opencodeGoApiKey}',
+			// eslint-disable-next-line no-template-curly-in-string
+			'x-opencode-session': '${opencodeGoSession}',
+			'x-opencode-client': 'ocs'
+		},
+		data: {
+			model,
+			text: {
+				format: {
+					type: 'json_schema',
+					name: 'ocs_quiz_response',
+					strict: true,
+					schema: {
+						type: 'object',
+						properties: {
+							answers: {
+								type: 'array',
+								items: { type: 'string' },
+								description: '选择题填正确选项代号（单选 ["B"]，多选 ["A","C"]）；填空/简答每空一个文本答案。'
+							},
+							used_image_ids: {
+								type: 'array',
+								items: { type: 'string' },
+								description: '实际参考的图片 ID，例如 Q-1、A-1；无图填空数组。'
+							},
+							ambiguous: {
+								type: 'boolean',
+								description: '任一必要图片看不清或归属不明时为 true。'
+							}
+						},
+						required: ['answers', 'used_image_ids', 'ambiguous'],
+						additionalProperties: false
+					}
+				}
+			},
+			input: { handler: OPENCODE_GO_INPUT_HANDLER }
+		},
+		handler: OPENCODE_GO_RESPONSE_HANDLER
+	} as AnswererWrapper;
 }
 
 export const CommonEvents = {
@@ -614,6 +716,87 @@ export const CommonProject = Project.create({
 								btn.style.fontSize = '14px';
 							};
 
+							/** 搜索增强配置（全局，仅保存在本机） */
+							const searchConfig = readAnswererSearchConfig();
+							const searchModeSelect = h(
+								'select',
+								{
+									className: 'base-style-active-form-control',
+									style: { backgroundColor: '#eef2f7', borderRadius: '2px', padding: '2px 8px' }
+								},
+								[
+									h('option', { value: 'off' }, '关闭'),
+									h('option', { value: 'builtin' }, '内置搜索（官方端点）'),
+									h('option', { value: 'custom' }, '自定义搜索')
+								]
+							);
+							searchModeSelect.value = searchConfig.mode;
+							const searchProviderSelect = h(
+								'select',
+								{
+									className: 'base-style-active-form-control',
+									style: { backgroundColor: '#eef2f7', borderRadius: '2px', padding: '2px 8px' }
+								},
+								[
+									h('option', { value: 'exa' }, 'Exa'),
+									h('option', { value: 'tavily' }, 'Tavily'),
+									h('option', { value: 'deepseek' }, 'DeepSeek')
+								]
+							);
+							searchProviderSelect.value = searchConfig.provider;
+							searchProviderSelect.disabled = searchConfig.mode !== 'custom';
+							searchModeSelect.onchange = () => {
+								const mode = searchModeSelect.value as AnswererSearchMode;
+								saveAnswererSearchConfig({ mode });
+								searchProviderSelect.disabled = mode !== 'custom';
+							};
+							searchProviderSelect.onchange = () =>
+								saveAnswererSearchConfig({
+									provider: searchProviderSelect.value as AnswererSearchProvider
+								});
+
+							/** OpenCode Go 预设插入 */
+							const openCodeModelInput = h('input', {
+								className: 'modal-input',
+								value: 'gpt-6-luna',
+								placeholder: '模型 ID',
+								style: { width: '180px' }
+							});
+							(openCodeModelInput as HTMLInputElement).setAttribute('list', 'ocs-opencode-models');
+							const openCodeModelList = h(
+								'datalist',
+								{ id: 'ocs-opencode-models' },
+								OPENCODE_GO_MODELS.map((model) => h('option', { value: model }))
+							);
+							const openCodePresetButton = h('button', '添加 OpenCode Go 预设', (btn) => {
+								btn.className = 'modal-cancel-button';
+								btn.style.padding = '4px 12px';
+								btn.style.fontSize = '13px';
+								btn.onclick = () => {
+									const model = (openCodeModelInput as HTMLInputElement).value.trim() || 'gpt-6-luna';
+									let list: AnswererWrapper[] = [];
+									const raw = textarea.value.trim();
+									if (raw) {
+										try {
+											const parsed = JSON.parse(raw);
+											list = Array.isArray(parsed) ? parsed : [parsed];
+										} catch {
+											$modal.alert({
+												content: '文本框内容不是有效的 JSON，请先清空或修正后再添加 OpenCode Go 预设。'
+											});
+											return;
+										}
+									}
+									const preset = createOpenCodeGoPreset(model);
+									list = list.filter((item) => item?.url !== preset.url);
+									list.push(preset);
+									textarea.value = JSON.stringify(list, null, 4);
+									$message.success({
+										content: '已添加 OpenCode Go 预设，请确认模型与密钥后点击「保存配置」。'
+									});
+								};
+							});
+
 							/** 手动配置底部（填写/修改区 + 操作按钮），自定义题库获取方式下显示 */
 							const manualFooter = h('div', { style: { width: '100%' } }, [
 								h('div', { className: 'separator secondary' }, '题库配置填写/修改区'),
@@ -621,17 +804,54 @@ export const CommonProject = Project.create({
 								h(
 									'div',
 									{ className: 'separator secondary', style: { marginTop: '12px' } },
-									'图片题 API 密钥（可选，仅保存在本机）'
+									'API 密钥（可选，仅保存在本机）'
 								),
 								h('div', { style: { marginTop: '8px', fontSize: '12px' } }, [
 									h(
 										'div',
 										{ className: 'secondary' },
 										// eslint-disable-next-line no-template-curly-in-string
-										'在题库配置中通过 ${openaiApiKey} / ${geminiApiKey} 占位符引用，例如请求头 Authorization: Bearer ${openaiApiKey}。密钥只保存在本机浏览器，不会写入题库配置，也不会随配置导出。'
+										'在题库配置中通过 ${openaiApiKey} / ${geminiApiKey} / ${opencodeGoApiKey} 等占位符引用，例如请求头 Authorization: Bearer ${openaiApiKey}。密钥只保存在本机浏览器，不会写入题库配置，也不会随配置导出。搜索密钥仅用于 Exa / Tavily / DeepSeek 搜索。'
 									),
-									createAnswererApiKeyField('openai', 'OpenAI API Key', 'sk-...'),
-									createAnswererApiKeyField('gemini', 'Gemini API Key', 'AIza... 或代理服务密钥')
+									h('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' } }, [
+										createAnswererApiKeyField('openai', 'OpenAI API Key', 'sk-...'),
+										createAnswererApiKeyField('gemini', 'Gemini API Key', 'AIza...'),
+										createAnswererApiKeyField('opencodeGo', 'OpenCode Go API Key', 'OpenCode Console 生成的 Key'),
+										createAnswererApiKeyField('deepseek', 'DeepSeek API Key', 'sk-...'),
+										createAnswererApiKeyField('exa', 'Exa API Key', 'Exa API Key'),
+										createAnswererApiKeyField('tavily', 'Tavily API Key', 'tvly-...')
+									])
+								]),
+								h('div', { className: 'separator secondary', style: { marginTop: '12px' } }, '搜索增强（可选）'),
+								h('div', { style: { marginTop: '8px', fontSize: '12px' } }, [
+									h(
+										'div',
+										{ className: 'secondary' },
+										'内置搜索：OpenAI 使用 web_search，Gemini 使用 Google Search grounding，DeepSeek 使用 Search API。自定义搜索：Exa / Tavily / DeepSeek，适用于任意自定义端点。搜索失败不会中断答题。'
+									),
+									h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '8px', marginTop: '8px' } }, [
+										h('label', { style: { display: 'flex', alignItems: 'center', gap: '4px' } }, [
+											h('span', '模式'),
+											searchModeSelect
+										]),
+										h('label', { style: { display: 'flex', alignItems: 'center', gap: '4px' } }, [
+											h('span', '自定义提供方'),
+											searchProviderSelect
+										])
+									])
+								]),
+								h('div', { className: 'separator secondary', style: { marginTop: '12px' } }, 'OpenCode Go（可选）'),
+								h('div', { style: { marginTop: '8px', fontSize: '12px' } }, [
+									h(
+										'div',
+										{ className: 'secondary' },
+										'OpenCode Go 面向编程代理，用于答题可能被限流或封禁，请自行评估风险。请求会自动补充 x-opencode-session、x-opencode-client 与 User-Agent，并改走 GM_xmlhttpRequest。'
+									),
+									h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '8px', marginTop: '8px' } }, [
+										openCodeModelInput,
+										openCodePresetButton
+									]),
+									openCodeModelList
 								]),
 								h('div', { style: { marginTop: '12px', fontSize: '12px' } }, [
 									// 解析器选项独占一行

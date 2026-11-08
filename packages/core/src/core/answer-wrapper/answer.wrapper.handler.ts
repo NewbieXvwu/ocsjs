@@ -1,6 +1,15 @@
 import { AnswererWrapper, SearchInformation, Result } from './interface';
 import { request } from '../utils/request';
 import { $ } from '../../utils';
+import {
+	applyBuiltinSearch,
+	applyOpenCodeHeaders,
+	injectSearchContext,
+	isOfficialDeepSeekEndpoint,
+	isOpenCodeGoEndpoint,
+	prepareExternalSearch,
+	readAnswererSearchOptions
+} from './answerer-search';
 
 export const AnswerWrapperHandlerConfig = {
 	// 超时时间，单位毫秒
@@ -290,6 +299,17 @@ export async function defaultAnswerWrapperHandler(
 	if (env.images === undefined) env.images = [];
 	if (env.suggestion_title === undefined) env.suggestion_title = '';
 	if (env.suggestion_options === undefined) env.suggestion_options = '';
+
+	// 搜索增强：同一题目的多个题库共享一次外部搜索；官方 DeepSeek 使用其 Search API 作为内置搜索。
+	const searchOptions = readAnswererSearchOptions(env);
+	const needsDeepSeekBuiltinSearch =
+		searchOptions.mode === 'builtin' && temp.some((wrapper) => isOfficialDeepSeekEndpoint(wrapper.url));
+	if (searchOptions.mode === 'custom' || needsDeepSeekBuiltinSearch) {
+		const provider = searchOptions.mode === 'custom' ? searchOptions.provider : 'deepseek';
+		const searchContext = await prepareExternalSearch(env, searchOptions, provider);
+		if (searchContext) injectSearchContext(env, searchContext);
+	}
+
 	// 多线程请求
 	await Promise.all(
 		temp.map(async (wrapper) => {
@@ -354,6 +374,9 @@ export async function defaultAnswerWrapperHandler(
 					requestData = data;
 					requestData = upgradeLegacyOpenAIMediaRequest(wrapper.url, requestData, env);
 					requestData = upgradeSavedChoiceInstructions(wrapper.url, requestData, env);
+					if (searchOptions.mode === 'builtin') {
+						requestData = applyBuiltinSearch(wrapper.url, requestData);
+					}
 					assertOpenAIImagesDelivered(wrapper.url, requestData, env);
 					assertGeminiImagesDelivered(wrapper.url, requestData, env);
 				} else {
@@ -361,16 +384,24 @@ export async function defaultAnswerWrapperHandler(
 				}
 
 				// 发送请求
+				let requestHeaders = resolvePlaceHolder(JSON.parse(JSON.stringify(headers || {})));
+				let requestType = type;
+				if (isOpenCodeGoEndpoint(wrapper.url)) {
+					requestHeaders = applyOpenCodeHeaders(requestHeaders, env);
+					// 浏览器 fetch 会丢弃 User-Agent 等受限请求头，OpenCode Go 需要
+					// 可识别的客户端标识与会话 ID，因此统一改走 GM_xmlhttpRequest。
+					requestType = 'GM_xmlhttpRequest';
+				}
 				const responseData = await Promise.race([
 					request(url.toString(), {
 						method,
 						// contentType: 历史遗留的命名问题
 						responseType: responseType || contentType,
 						data: requestData,
-						type,
+						type: requestType,
 						// 请求头同样支持 ${openaiApiKey} / ${geminiApiKey} 等占位符，
 						// 避免用户把密钥直接写进题库配置（配置可能被导出或分享）。
-						headers: resolvePlaceHolder(JSON.parse(JSON.stringify(headers || {})))
+						headers: requestHeaders
 					}),
 					$.sleep((AnswerWrapperHandlerConfig.timeout_seconds ?? 60) * 1000)
 				]);
